@@ -103,7 +103,7 @@ sudo apt install build-essential libglfw3-dev libgl-dev
 
 ```bash
 # Clone ou entre no diretório do projeto
-cd 8080Emulator_teste
+cd Emulator
 
 # Compila tudo (CPU core, GUI, ImGui, GLAD, CP/M, etc.)
 make
