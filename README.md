@@ -366,8 +366,8 @@ O CCP (`cpm_ccp.cpp`) implementa um shell interativo com os seguintes comandos b
 | `REN ou MV`  | `REN novo.ext=velho.ext`     | Renomeia arquivo                   |
 | `TYPE`       | `TYPE arquivo.ext`           | Exibe conteúdo do arquivo          |
 | `USER`       | `USER n`                     | Muda user ID (0–15)                |
-| `CLS`        | ` `                          | Limpa o terminal                   |
-| `VER`        | `                            | Mostra versão ("CP/M 2.2 Emulator")|
+| `CLS`        |                              | Limpa o terminal                   |
+| `VER`        |                              | Mostra versão ("CP/M 2.2 Emulator")|
 | `A:/ B:/ C:/ D:`|                           | Troca de drive                     |
 
 Qualquer outro nome é interpretado como um arquivo `.COM` a ser carregado na TPA (0x0100) e executado.
