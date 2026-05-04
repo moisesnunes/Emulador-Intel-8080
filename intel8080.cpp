@@ -66,9 +66,9 @@ void intel8080::WriteMem(uint16_t address, uint16_t value)
 
 void intel8080::Set_SZP_Flags(uint16_t val)
 {
-    this->sf = val >> 7;
-    this->zf = val == 0;
-    this->pf = (val % 2) == 0;
+    this->sf = (val >> 7) & 1;
+    this->zf = (val & 0xFF) == 0;
+    this->pf = !__builtin_parity(val & 0xFF); // 1 = even number of 1-bits
 }
 
 int instruction = 0;
@@ -1021,21 +1021,22 @@ int LoadRomFile(intel8080 *cpu, std::string fileName1, std::string fileName2, st
     return 0;
 }
 
-int LoadRomFile(intel8080 *cpu, const std::string &exeDir, const std::vector<std::string> &romFiles, uint16_t startOffset)
+int LoadRomFile(intel8080 *cpu, const std::string &exeDir, const std::vector<RomEntry> &romFiles, uint16_t startOffset)
 {
     char *fileContent;
-    int totalSize = startOffset;
-    for (const auto &romFile : romFiles)
+    int cursor = startOffset;
+    for (const auto &entry : romFiles)
     {
-        int fileSize = SimpleOpenFile(exeDir + romFile, fileContent);
+        int fileSize = SimpleOpenFile(exeDir + entry.path, fileContent);
         if (fileSize <= 0)
         {
-            std::cout << "Failed to load: " << exeDir + romFile << std::endl;
+            std::cout << "Failed to load: " << exeDir + entry.path << std::endl;
             return fileSize;
         }
-        LoadRomtoMem(cpu, fileContent, fileSize, totalSize);
+        int addr = (entry.loadAddr >= 0) ? entry.loadAddr : cursor;
+        LoadRomtoMem(cpu, fileContent, fileSize, (uint16_t)addr);
         delete[] fileContent;
-        totalSize += fileSize;
+        cursor = addr + fileSize;
     }
     return 0;
 }
