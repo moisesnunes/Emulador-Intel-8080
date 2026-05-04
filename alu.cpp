@@ -103,20 +103,8 @@ void AddReg(intel8080 *cpu, uint8_t *reg, uint8_t val, bool cf)
 
 void SubReg(intel8080 *cpu, uint8_t *reg, uint8_t val, bool cf)
 {
-    uint8_t result = *reg - val - cf;
-    cpu->cf = (val + cf) > *reg;
-
-    cpu->Set_SZP_Flags(result);
-
-    if (cf == 0 & result == 0)
-    {
-        cpu->zf = 0;
-    }
-
-    *reg = result;
-
-    // AddReg(cpu, reg, !val, !cf);
-    // cpu->cf = !cpu->cf;
+    AddReg(cpu, reg, ~val, !cf);
+    cpu->cf = !cpu->cf;
 }
 
 void INX(intel8080 *cpu, uint8_t *a, uint8_t *b)
@@ -144,7 +132,7 @@ uint8_t INR(intel8080 *cpu, uint8_t registerVal)
 uint8_t DCR(intel8080 *cpu, uint8_t registerVal)
 {
     uint8_t result = registerVal - 1;
-    cpu->acf = (result & 0xF) == 0xF;
+    cpu->acf = !((result & 0xF) == 0xF);
     cpu->Set_SZP_Flags(result);
     return result;
 }
@@ -152,9 +140,9 @@ uint8_t DCR(intel8080 *cpu, uint8_t registerVal)
 void ANA(intel8080 *cpu, uint8_t *reg, uint8_t val)
 {
     uint8_t result = *reg & val;
-    cpu->acf = (result & 0xF) == 0x0;
-    cpu->Set_SZP_Flags(result);
+    cpu->acf = ((*reg | val) >> 3) & 1; // Intel spec: OR of bit 3 of both operands
     cpu->cf = 0;
+    cpu->Set_SZP_Flags(result);
     *reg = result;
 }
 
@@ -178,9 +166,8 @@ void ORA(intel8080 *cpu, uint8_t *reg, uint8_t val)
 
 void CMP(intel8080 *cpu, uint8_t reg, uint8_t val)
 {
-    uint8_t result = reg - val;
-    cpu->Set_SZP_Flags(result);
-    cpu->cf = (reg < val);
+    uint8_t tmp = reg;
+    SubReg(cpu, &tmp, val, 0);
 }
 
 void SHLD(intel8080 *cpu)
@@ -253,20 +240,22 @@ void RAR(intel8080 *cpu)
 
 void DAA(intel8080 *cpu)
 {
-    uint16_t result = cpu->A;
-    if (((cpu->A & 0x0F) > 9) || cpu->acf)
+    bool cy = cpu->cf;
+    uint8_t correction = 0;
+    uint8_t lsb = cpu->A & 0x0F;
+    uint8_t msb = cpu->A >> 4;
+
+    if (cpu->acf || lsb > 9)
+        correction += 0x06;
+
+    if (cpu->cf || msb > 9 || (msb >= 9 && lsb > 9))
     {
-        result += 6;
-        cpu->acf = 0;
+        correction += 0x60;
+        cy = 1;
     }
 
-    if ((((result >> 4) & 0x0F) > 9) || cpu->cf)
-    {
-        result += (6 << 4);
-    }
-    cpu->cf = (result >> 8) & 0x01;
-    cpu->Set_SZP_Flags(cpu->A);
-    cpu->A = result & 0xFF;
+    AddReg(cpu, &cpu->A, correction, 0);
+    cpu->cf = cy;
 }
 
 void LHLD(intel8080 *cpu)
@@ -386,69 +375,19 @@ void RET(intel8080 *cpu)
     // std::cout << "added to SP + 2 in RET" << std::endl;
 }
 
-void RNZ(intel8080 *cpu)
-{
-    if (!cpu->zf)
-    {
-        RET(cpu);
-    }
-}
+// Conditional RET: base cost is 5 cycles (table); add 6 when taken → 11 total.
+#define COND_RET(cpu, cond) do { if (cond) { RET(cpu); (cpu)->cycles += 6; (cpu)->cyclesInterrupt += 6; } } while(0)
 
-void RNC(intel8080 *cpu)
-{
-    if (!cpu->cf)
-    {
-        RET(cpu);
-    }
-}
+void RNZ(intel8080 *cpu) { COND_RET(cpu, !cpu->zf); }
+void RNC(intel8080 *cpu) { COND_RET(cpu, !cpu->cf); }
+void RPO(intel8080 *cpu) { COND_RET(cpu, !cpu->pf); }
+void RP (intel8080 *cpu) { COND_RET(cpu, !cpu->sf); }
+void RZ (intel8080 *cpu) { COND_RET(cpu,  cpu->zf); }
+void RC (intel8080 *cpu) { COND_RET(cpu,  cpu->cf); }
+void RPE(intel8080 *cpu) { COND_RET(cpu,  cpu->pf); }
+void RM (intel8080 *cpu) { COND_RET(cpu,  cpu->sf); }
 
-void RPO(intel8080 *cpu)
-{
-    if (!cpu->pf)
-    {
-        RET(cpu);
-    }
-}
-
-void RP(intel8080 *cpu)
-{
-    if (!cpu->sf)
-    {
-        RET(cpu);
-    }
-}
-
-void RZ(intel8080 *cpu)
-{
-    if (cpu->zf)
-    {
-        RET(cpu);
-    }
-}
-
-void RC(intel8080 *cpu)
-{
-    if (cpu->cf)
-    {
-        RET(cpu);
-    }
-}
-
-void RPE(intel8080 *cpu)
-{
-    if (cpu->pf)
-    {
-        RET(cpu);
-    }
-}
-
-void RM(intel8080 *cpu)
-{
-    if (cpu->sf)
-    {
-        RET(cpu);
-    }
-}
+#undef COND_RET
 
 void PushRegisterPair(intel8080 *cpu, uint8_t HReg, uint8_t LReg)
 {
@@ -511,101 +450,22 @@ void Call(intel8080 *cpu)
     // std::cout << "subtracted 2 from SP in Call" << std::endl;
 }
 
-void CNZ(intel8080 *cpu)
-{
-    if (!cpu->zf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
+// Conditional CALL: base cost is 11 cycles (table); add 6 when taken → 17 total.
+#define COND_CALL(cpu, cond) do { \
+    if (cond) { Call(cpu); (cpu)->cycles += 6; (cpu)->cyclesInterrupt += 6; } \
+    else      { AdvanceWord(cpu); } \
+} while(0)
 
-void CNC(intel8080 *cpu)
-{
-    if (!cpu->cf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
+void CNZ(intel8080 *cpu) { COND_CALL(cpu, !cpu->zf); }
+void CNC(intel8080 *cpu) { COND_CALL(cpu, !cpu->cf); }
+void CPO(intel8080 *cpu) { COND_CALL(cpu, !cpu->pf); }
+void CP (intel8080 *cpu) { COND_CALL(cpu, !cpu->sf); }
+void CZ (intel8080 *cpu) { COND_CALL(cpu,  cpu->zf); }
+void CC (intel8080 *cpu) { COND_CALL(cpu,  cpu->cf); }
+void CPE(intel8080 *cpu) { COND_CALL(cpu,  cpu->pf); }
+void CM (intel8080 *cpu) { COND_CALL(cpu,  cpu->sf); }
 
-void CPO(intel8080 *cpu)
-{
-    if (!cpu->pf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
-
-void CP(intel8080 *cpu)
-{
-    if (!cpu->sf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
-
-void CZ(intel8080 *cpu)
-{
-    if (cpu->zf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
-
-void CC(intel8080 *cpu)
-{
-    if (cpu->cf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
-
-void CPE(intel8080 *cpu)
-{
-    if (cpu->pf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
-
-void CM(intel8080 *cpu)
-{
-    if (cpu->sf)
-    {
-        Call(cpu);
-    }
-    else
-    {
-        AdvanceWord(cpu);
-    }
-}
+#undef COND_CALL
 
 void RST(intel8080 *cpu, uint8_t N)
 {
