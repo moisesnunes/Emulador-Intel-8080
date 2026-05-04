@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "game_config.h"
 
 class intel8080
 {
@@ -37,7 +38,7 @@ void ExecuteOpCode(uint8_t OpCode, intel8080 *cpu);
 void LoadRomtoMem(intel8080 *&cpu, char *&ROMData, int ROMSize, uint16_t memoryStart);
 int SimpleOpenFile(std::string fileName, char *&fileContent);
 int LoadRomFile(intel8080 *cpu, std::string fileName1, std::string fileName2 = "", std::string fileName3 = "", std::string fileName4 = "");
-int LoadRomFile(intel8080 *cpu, const std::string &exeDir, const std::vector<std::string> &romFiles, uint16_t startOffset = 0x0000);
+int LoadRomFile(intel8080 *cpu, const std::string &exeDir, const std::vector<RomEntry> &romFiles, uint16_t startOffset = 0x0000);
 
 void StartISR(intel8080 *cpu);
 
