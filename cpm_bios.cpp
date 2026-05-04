@@ -17,6 +17,22 @@
 #include <cctype>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
+
+// CP/M SYS attribute is stored as the extended attribute "user.cpm.sys" = "1".
+// R/O is mapped to POSIX write-permission bits (chmod) as before.
+static void HostSetSys(const std::string& path, bool sys)
+{
+    if (sys)
+        setxattr(path.c_str(), "user.cpm.sys", "1", 1, 0);
+    else
+        removexattr(path.c_str(), "user.cpm.sys");
+}
+static bool HostGetSys(const std::string& path)
+{
+    char v[2] = {};
+    return getxattr(path.c_str(), "user.cpm.sys", v, 1) == 1 && v[0] == '1';
+}
 
 // ── FCB field offsets ────────────────────────────────────────────────────────
 static constexpr int FCB_DRIVE = 0;
@@ -31,17 +47,335 @@ static constexpr int FCB_CR = 32; // current record within extent
 static constexpr int MAX_OPEN_FILES = 16;
 struct OpenFile
 {
-    FILE *fp = nullptr;
-    bool readOnly = false;
+    FILE*     fp       = nullptr;
+    DskImage* dsk      = nullptr; // non-null for DSK image files
+    bool      readOnly = false;
+    char      name[11] = {};      // 11-char space-padded CP/M name (DSK only)
+    char      hostPath[512] = {}; // host filesystem path (non-DSK files)
 };
 static OpenFile openFiles[MAX_OPEN_FILES];
 
 static int AllocFileSlot()
 {
     for (int i = 1; i < MAX_OPEN_FILES; i++)
-        if (!openFiles[i].fp)
+        if (!openFiles[i].fp && !openFiles[i].dsk)
             return i;
     return 0;
+}
+
+// Find an already-open host-file slot by absolute path (for re-open rewind).
+static int FindOpenSlotByPath(const char *path)
+{
+    for (int i = 1; i < MAX_OPEN_FILES; i++)
+        if (openFiles[i].fp && strcmp(openFiles[i].hostPath, path) == 0)
+            return i;
+    return 0;
+}
+
+// Set FCB_RC to the number of 128-byte records in fp, capped at 128 for files >= 16 KB.
+// Whitesmith C, LK80 linker, and Aztec C depend on this being set after open/make/write.
+static void FCBSetRecordCount(intel8080 *cpu, uint16_t fcbAddr, FILE *fp)
+{
+    if (!fp) return;
+    long cur = ftell(fp);
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, cur, SEEK_SET);
+    if (size >= 16 * 1024)
+        cpu->memory[fcbAddr + FCB_RC] = 128;
+    else
+        cpu->memory[fcbAddr + FCB_RC] = (uint8_t)((size + 127) / 128);
+}
+
+// ── DSK helpers ───────────────────────────────────────────────────────────────
+
+// Return the DskImage for the drive referenced by FCB byte 0.
+static DskImage* FCBGetDsk(intel8080* cpu, CPMState& cpm, uint16_t fcb)
+{
+    uint8_t drv = cpu->memory[fcb];
+    int d = (drv == 0) ? cpm.currentDrive : (int)(drv - 1);
+    if (d < 0 || d >= MAX_DRIVES) d = 0;
+    DskImage* dsk = cpm.diskImages[d];
+    return (dsk && dsk->isOpen()) ? dsk : nullptr;
+}
+
+// Extract FCB bytes 1–11 as uppercase 11-char CP/M name (preserves '?' wildcards).
+static void FCBGetName(intel8080* cpu, uint16_t fcb, char name[11])
+{
+    for (int i = 0; i < 11; i++)
+        name[i] = (char)toupper((unsigned char)(cpu->memory[fcb + 1 + i] & 0x7F));
+}
+
+// Scan the DSK directory for an entry matching (user, name[11], extentNum).
+// Pass extentNum = -1 to match any extent (first found).
+static int DskFindEntry(DskImage* dsk, uint8_t user, const char name[11], int extNum, int s2 = -1)
+{
+    uint8_t e[32];
+    for (int i = 0; i < dsk->dirEntries(); i++) {
+        dsk->dskRead(dsk->dirByteOff(i), e, 32);
+        if (e[0] == 0xE5) continue;
+        if (e[0] != user) continue;
+        if (extNum >= 0 && e[12] != (uint8_t)extNum) continue;
+        if (s2 >= 0 && e[14] != (uint8_t)s2) continue;
+        bool ok = true;
+        for (int j = 0; j < 11; j++)
+            if ((e[1 + j] & 0x7F) != (uint8_t)name[j]) { ok = false; break; }
+        if (ok) return i;
+    }
+    return -1;
+}
+
+// Allocate a free directory slot (user byte = 0xE5).  Returns index or -1.
+static int DskAllocDir(DskImage* dsk)
+{
+    uint8_t e[32];
+    for (int i = 0; i < dsk->dirEntries(); i++) {
+        dsk->dskRead(dsk->dirByteOff(i), e, 32);
+        if (e[0] == 0xE5) return i;
+    }
+    return -1;
+}
+
+// Find a free data block by scanning all directory block pointers.
+// Returns block number, or -1 if the disk is full.
+static int DskAllocBlock(DskImage* dsk)
+{
+    int dirBlks = ((dsk->drm + 1) * 32 + dsk->bytesPerBlock() - 1) / dsk->bytesPerBlock();
+    std::vector<bool> used(dsk->dsm + 1, false);
+    for (int i = 0; i < dirBlks; i++) used[i] = true;
+
+    uint8_t e[32];
+    int ptrs = dsk->blockPtrs();
+    for (int i = 0; i < dsk->dirEntries(); i++) {
+        dsk->dskRead(dsk->dirByteOff(i), e, 32);
+        if (e[0] == 0xE5) continue;
+        for (int j = 0; j < ptrs; j++) {
+            int blk = e[16 + j];
+            if (blk > 0 && blk <= dsk->dsm) used[blk] = true;
+        }
+    }
+    for (int i = dirBlks; i <= dsk->dsm; i++)
+        if (!used[i]) return i;
+    return -1;
+}
+
+// Read 128-byte record from DSK at sequential position (ex, s2, cr) for file name[11].
+static uint8_t DskReadRec(DskImage* dsk, uint8_t user, const char name[11],
+                           uint8_t ex, uint8_t s2, uint8_t cr, uint8_t buf[128])
+{
+    int idx = DskFindEntry(dsk, user, name, (int)ex, (int)s2);
+    if (idx < 0) return 0x01; // EOF: extent not found
+
+    uint8_t e[32];
+    dsk->dskRead(dsk->dirByteOff(idx), e, 32);
+
+    int rpb = dsk->recsPerBlock();
+    int bi  = cr / rpb; // block pointer index (0–15)
+    int ri  = cr % rpb; // record within block (0–7)
+    if (bi >= dsk->blockPtrs()) return 0x01;
+
+    uint8_t blk = e[16 + bi];
+    if (blk == 0) return 0x01; // unallocated = EOF
+
+    memset(buf, 0x1A, 128);
+    dsk->dskRead(dsk->recByteOff(blk, ri), buf, 128);
+    return 0x00;
+}
+
+// Write 128-byte record to DSK, allocating directory entries and blocks as needed.
+static uint8_t DskWriteRec(DskImage* dsk, uint8_t user, const char name[11],
+                            uint8_t ex, uint8_t s2, uint8_t cr, const uint8_t buf[128])
+{
+    if (dsk->readOnly) return 0xFF;
+
+    int idx = DskFindEntry(dsk, user, name, (int)ex, (int)s2);
+    uint8_t e[32];
+    bool dirty = false;
+
+    if (idx < 0) {
+        idx = DskAllocDir(dsk);
+        if (idx < 0) return 0x02; // directory full
+        memset(e, 0, 32);
+        e[0] = user;
+        for (int j = 0; j < 11; j++) e[1 + j] = (uint8_t)name[j];
+        e[12] = ex; e[14] = s2;
+        dirty = true;
+    } else {
+        dsk->dskRead(dsk->dirByteOff(idx), e, 32);
+    }
+
+    int rpb = dsk->recsPerBlock();
+    int bi  = cr / rpb;
+    int ri  = cr % rpb;
+    if (bi >= dsk->blockPtrs()) return 0x02;
+
+    uint8_t blk = e[16 + bi];
+    if (blk == 0) {
+        int nb = DskAllocBlock(dsk);
+        if (nb < 0) return 0x02; // disk full
+        e[16 + bi] = (uint8_t)nb;
+        blk = (uint8_t)nb;
+        dirty = true;
+    }
+
+    // RC = record count in the last used block of this extent.
+    uint8_t rc = (uint8_t)(ri + 1);
+    if (rc > e[15]) { e[15] = rc; dirty = true; }
+
+    if (dirty)
+        dsk->dskWrite(dsk->dirByteOff(idx), e, 32);
+
+    dsk->dskWrite(dsk->recByteOff(blk, ri), buf, 128);
+    dsk->cache.flush();
+    return 0x00;
+}
+
+// ── DskMount / DskUnmount ─────────────────────────────────────────────────────
+
+// Known CP/M disk formats identified by file size.
+// All images are treated as flat arrays of 128-byte logical sectors regardless
+// of the original physical sector size (same convention used by cpmtools/z80pack).
+// Values match the CP/M 2.2 DPB for each format.
+static const struct KnownFmt {
+    long size; DskGeometry geo; const char* label;
+} kFormats[] = {
+    // IBM 3740 8" single-density — the CP/M 2.2 reference format
+    // 77T × 26S × 128B = 256 256 bytes
+    { 256256L, { 26, 3, 242,  63, 2, {} }, "IBM 8\" SD" },
+    // IBM 8" double-density, single-sided
+    // 77T × 26 phys × 256B → SPT=52 logical, 512 512 bytes
+    { 512512L, { 52, 4, 242, 127, 2, {} }, "IBM 8\" DD/SS" },
+    // IBM 8" double-density, double-sided (two-sided)
+    // 154T × 52 logical × 128B = 1 025 024 bytes
+    { 1025024L, { 52, 4, 493, 255, 2, {} }, "IBM 8\" DD/DS" },
+    // Osborne 1 single-density
+    // 40T × 10 phys × 256B → SPT=20 logical, 102 400 bytes
+    { 102400L, { 20, 3, 91, 63, 3, {} }, "Osborne 1 SD" },
+    // Kaypro II / 2'84 single-density (NOTE: same size as Osborne 1 DD —
+    // use a .geo sidecar if the auto-detect picks the wrong format)
+    // 40T × 10 phys × 512B → SPT=40 logical, 204 800 bytes
+    { 204800L, { 40, 3, 194, 63, 1, {} }, "Kaypro II (5.25\" SD)" },
+    // Kaypro 4 / 10 double-density
+    // 80T × 10 phys × 512B → SPT=40 logical, 409 600 bytes
+    { 409600L, { 40, 4, 196, 127, 1, {} }, "Kaypro 4 (5.25\" DD)" },
+};
+static constexpr int kFormatsCount = (int)(sizeof(kFormats) / sizeof(kFormats[0]));
+
+// Parse a <path>.geo sidecar file into geo.  Returns true if the file exists.
+// Format: one "key=value" per line.  Unrecognised keys are silently ignored.
+// skew= takes a comma-separated list of physical sector indices, e.g.
+//   skew=0,6,12,18,24,4,10,16,22,2,8,14,20,1,7,13,19,25,5,11,17,23,3,9,15,21
+static bool ParseGeoFile(const std::string& imagePath, DskGeometry& geo)
+{
+    std::string geoPath = imagePath + ".geo";
+    FILE* f = fopen(geoPath.c_str(), "r");
+    if (!f) return false;
+
+    char line[512];
+    while (fgets(line, (int)sizeof(line), f)) {
+        char key[64] = {}, val[448] = {};
+        if (sscanf(line, " %63[^= ] = %447[^\n\r]", key, val) != 2) continue;
+        std::string k(key), v(val);
+        if      (k == "spt") geo.spt = atoi(v.c_str());
+        else if (k == "bsh") geo.bsh = atoi(v.c_str());
+        else if (k == "dsm") geo.dsm = atoi(v.c_str());
+        else if (k == "drm") geo.drm = atoi(v.c_str());
+        else if (k == "off") geo.off = atoi(v.c_str());
+        else if (k == "skew") {
+            geo.skew.clear();
+            char* p = val;
+            while (*p) {
+                while (*p == ' ' || *p == ',') ++p;
+                if (!*p) break;
+                geo.skew.push_back(atoi(p));
+                while (*p && *p != ',' && *p != ' ') ++p;
+            }
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+bool DskMountWithGeometry(CPMState& cpm, int drive, const std::string& hostPath,
+                          const DskGeometry& geo, bool readOnly)
+{
+    if (drive < 0 || drive >= MAX_DRIVES) return false;
+    DskUnmount(cpm, drive);
+
+    FILE* fp = readOnly ? nullptr : fopen(hostPath.c_str(), "rb+");
+    bool  ro = readOnly;
+    if (!fp) { fp = fopen(hostPath.c_str(), "rb"); ro = true; }
+    if (!fp) return false;
+
+    DskImage* dsk  = new DskImage;
+    dsk->fp        = fp;
+    dsk->readOnly  = ro;
+    dsk->path      = hostPath;
+    dsk->spt       = geo.spt;
+    dsk->bsh       = geo.bsh;
+    dsk->dsm       = geo.dsm;
+    dsk->drm       = geo.drm;
+    dsk->off       = geo.off;
+    dsk->skewTable = geo.skew;
+
+    cpm.diskImages[drive] = dsk;
+    return true;
+}
+
+bool DskMount(CPMState& cpm, int drive, const std::string& hostPath, bool readOnly)
+{
+    DskGeometry geo; // IBM 8" SD defaults
+
+    // 1. Try sidecar <image>.geo — highest priority.
+    if (!ParseGeoFile(hostPath, geo)) {
+        // 2. Auto-detect by file size.
+        FILE* tmp = fopen(hostPath.c_str(), "rb");
+        if (!tmp) return false;
+        fseek(tmp, 0, SEEK_END);
+        long sz = ftell(tmp);
+        fclose(tmp);
+
+        for (int i = 0; i < kFormatsCount; i++) {
+            if (kFormats[i].size == sz) { geo = kFormats[i].geo; break; }
+        }
+        // 3. Fallback: defaults already set (IBM 8" SD).
+    }
+
+    return DskMountWithGeometry(cpm, drive, hostPath, geo, readOnly);
+}
+
+void DskUnmount(CPMState& cpm, int drive)
+{
+    if (drive < 0 || drive >= MAX_DRIVES) return;
+    DskImage* dsk = cpm.diskImages[drive];
+    if (!dsk) return;
+
+    // Clear all open-file slots that reference this image.
+    for (int i = 1; i < MAX_OPEN_FILES; i++)
+        if (openFiles[i].dsk == dsk) openFiles[i] = {};
+
+    // Remove their fcbSlotMap entries.
+    std::vector<uint16_t> stale;
+    for (auto& [addr, slot] : cpm.fcbSlotMap)
+        if (slot > 0 && slot < MAX_OPEN_FILES && openFiles[slot].dsk == nullptr
+            && cpm.fcbSlotMap.count(addr))
+            stale.push_back(addr);
+    // Simpler: just scan all slots for orphaned entries.
+    stale.clear();
+    for (auto& [addr, slot] : cpm.fcbSlotMap)
+        if (slot > 0 && slot < MAX_OPEN_FILES &&
+            !openFiles[slot].fp && !openFiles[slot].dsk)
+            stale.push_back(addr);
+    for (uint16_t a : stale) cpm.fcbSlotMap.erase(a);
+
+    if (dsk->fp) { dsk->cache.flush(); fclose(dsk->fp); dsk->fp = nullptr; }
+    delete dsk;
+    cpm.diskImages[drive] = nullptr;
+}
+
+void DskUnmountAll(CPMState& cpm)
+{
+    for (int i = 0; i < MAX_DRIVES; i++) DskUnmount(cpm, i);
 }
 
 // ── TerminalState ────────────────────────────────────────────────────────────
@@ -53,12 +387,22 @@ void TerminalState::clear()
     for (int r = 0; r < ROWS; r++)
         memset(buffer[r], ' ', COLS);
     cursorX = cursorY = 0;
-    escState = EscState::NORMAL;
+    escState         = EscState::NORMAL;
+    ansiParamCount   = 0;
+    ansiParamPending = false;
+}
+
+// Scroll the display up one line.
+static void TermScroll(TerminalState& t)
+{
+    for (int r = 0; r < TerminalState::ROWS - 1; r++)
+        memcpy(t.buffer[r], t.buffer[r + 1], TerminalState::COLS);
+    memset(t.buffer[TerminalState::ROWS - 1], ' ', TerminalState::COLS);
+    t.cursorY = TerminalState::ROWS - 1;
 }
 
 // Write one byte to the terminal, advancing the cursor and interpreting
-// ADM-3A escape sequences.  Printable characters are placed directly into
-// the grid; control codes move the cursor or erase parts of the screen.
+// ADM-3A and ANSI/VT100 (CSI) escape sequences.
 void TerminalState::putChar(char ch)
 {
     uint8_t b = (uint8_t)ch;
@@ -66,39 +410,249 @@ void TerminalState::putChar(char ch)
     // ── Escape sequence continuation ─────────────────────────────────────
     switch (escState)
     {
+    // ── ESC followed by a single letter ──────────────────────────────
     case EscState::ESC:
-        if (ch == '=')
+        switch (ch)
         {
+        case '[':
+            // ANSI/VT100 CSI introducer (all terminal types)
+            ansiParamCount   = 0;
+            ansiParamPending = false;
+            for (int i = 0; i < MAX_PARAMS; i++) ansiParams[i] = 0;
+            escState = EscState::ESC_BRACKET;
+            return;
+        case '=':
+            // ADM-3A / IBM 3101 alternate keypad / cursor-address introducer
             escState = EscState::ESC_EQ;
-        }
-        else if (ch == 'T')
-        { // ESC T — erase to end of line
+            return;
+        case 'A':
+            if (cursorY > 0) cursorY--;
+            break;
+        case 'B':
+            if (cursorY < ROWS - 1) cursorY++;
+            break;
+        case 'C':
+            if (cursorX < COLS - 1) cursorX++;
+            break;
+        case 'D':
+            if (cursorX > 0) cursorX--;
+            break;
+        case 'E':
+            clear();
+            break;
+        case 'H':
+            cursorX = cursorY = 0;
+            break;
+        case 'I': // VT52 / Visual 200 / IBM 3101: reverse index (scroll down, cursor stays)
+            if (termType == TermType::IBM3101 || termType == TermType::VISUAL200) {
+                if (cursorY == 0) {
+                    for (int r = ROWS - 1; r > 0; r--)
+                        memcpy(buffer[r], buffer[r - 1], COLS);
+                    memset(buffer[0], ' ', COLS);
+                } else {
+                    cursorY--;
+                }
+            }
+            break;
+        case 'J':
+            // erase from cursor to end of screen (all terminals)
             memset(buffer[cursorY] + cursorX, ' ', COLS - cursorX);
-            escState = EscState::NORMAL;
-        }
-        else if (ch == 'Y')
-        { // ESC Y — erase to end of screen
+            for (int r = cursorY + 1; r < ROWS; r++) memset(buffer[r], ' ', COLS);
+            break;
+        case 'K':
+        case 'T':
             memset(buffer[cursorY] + cursorX, ' ', COLS - cursorX);
-            for (int r = cursorY + 1; r < ROWS; r++)
-                memset(buffer[r], ' ', COLS);
-            escState = EscState::NORMAL;
+            break;
+        case 'L': // VT52 / Visual 200 / IBM 3101: insert line at cursor row
+            if (termType == TermType::IBM3101 || termType == TermType::VISUAL200) {
+                for (int r = ROWS - 1; r > cursorY; r--)
+                    memcpy(buffer[r], buffer[r - 1], COLS);
+                memset(buffer[cursorY], ' ', COLS);
+            }
+            break;
+        case 'M': // VT52 / Visual 200 / IBM 3101: delete line at cursor row
+            if (termType == TermType::IBM3101 || termType == TermType::VISUAL200) {
+                for (int r = cursorY; r < ROWS - 1; r++)
+                    memcpy(buffer[r], buffer[r + 1], COLS);
+                memset(buffer[ROWS - 1], ' ', COLS);
+            }
+            break;
+        case 'Y':
+            if (termType == TermType::IBM3101 || termType == TermType::VISUAL200) {
+                // VT52-style cursor address: ESC Y (row+0x1F) (col+0x1F), 1-based
+                escState = EscState::ESC_Y;
+                return;
+            }
+            // ADM-3A: ESC Y = erase from cursor to end of screen
+            memset(buffer[cursorY] + cursorX, ' ', COLS - cursorX);
+            for (int r = cursorY + 1; r < ROWS; r++) memset(buffer[r], ' ', COLS);
+            break;
+        case 'Z': // identify terminal — ignore
+            break;
+        case '*': // IBM 3101: clear display
+        case ';': // IBM 3101: clear display (alternate)
+            if (termType == TermType::IBM3101)
+                clear();
+            break;
+        case '3': case '4': case '5': case '6':
+        case 'x': case 'y': // Visual 200 / IBM 3101 video attributes — ignore
+            break;
+        default:
+            break;
         }
-        else
-        {
-            escState = EscState::NORMAL;
-        }
+        escState = EscState::NORMAL;
         return;
+
+    // ── ADM-3A: ESC = row col cursor positioning ──────────────────────
     case EscState::ESC_EQ:
-        // "ESC = row" — save the row byte (bias +32) and wait for column.
-        escRow = std::max(0, (int)(b - 32));
+        escRow   = std::max(0, (int)(b - 32));
         escState = EscState::ESC_EQ_ROW;
         return;
     case EscState::ESC_EQ_ROW:
-        // "ESC = row col" — move cursor to (col-32, row-32), clamped to grid.
-        cursorY = std::min(escRow, ROWS - 1);
-        cursorX = std::clamp((int)(b - 32), 0, COLS - 1);
+        cursorY  = std::min(escRow, ROWS - 1);
+        cursorX  = std::clamp((int)(b - 32), 0, COLS - 1);
         escState = EscState::NORMAL;
         return;
+
+    // ── VT52 / Visual 200 / IBM 3101: ESC Y row col cursor positioning ──
+    // Encoding: 1-based position + 0x1F, so 0x20 (space) = row/col 1.
+    case EscState::ESC_Y:
+        escRow   = std::max(0, (int)b - 0x20); // 0-based row
+        escState = EscState::ESC_Y_ROW;
+        return;
+    case EscState::ESC_Y_ROW:
+        cursorY  = std::min(escRow, ROWS - 1);
+        cursorX  = std::clamp((int)b - 0x20, 0, COLS - 1);
+        escState = EscState::NORMAL;
+        return;
+
+    // ── ANSI/VT100: ESC [ {params} {final} ───────────────────────────
+    case EscState::ESC_BRACKET:
+    {
+        if (b >= '0' && b <= '9')
+        {
+            if (!ansiParamPending)
+            {
+                if (ansiParamCount < MAX_PARAMS) ansiParamCount++;
+                ansiParamPending = true;
+            }
+            ansiParams[ansiParamCount - 1] =
+                ansiParams[ansiParamCount - 1] * 10 + (b - '0');
+            return;
+        }
+        if (b == ';')
+        {
+            if (!ansiParamPending && ansiParamCount < MAX_PARAMS)
+                ansiParamCount++;      // empty field → implicit 0
+            ansiParamPending = false;
+            if (ansiParamCount < MAX_PARAMS) ansiParamCount++;
+            return;
+        }
+
+        // Final byte — commit and dispatch.
+        ansiParamPending = false;
+
+        // p1/p2: default to 1 (most cursor commands). p1z: raw 0-default for mode selects.
+        int p1  = (ansiParamCount >= 1 && ansiParams[0] != 0) ? ansiParams[0] : 1;
+        int p2  = (ansiParamCount >= 2 && ansiParams[1] != 0) ? ansiParams[1] : 1;
+        int p1z = (ansiParamCount >= 1) ? ansiParams[0] : 0;
+
+        switch (ch)
+        {
+        case 'H': // CUP — cursor position (1-based row, col)
+        case 'f':
+            cursorY = std::clamp(p1 - 1, 0, ROWS - 1);
+            cursorX = std::clamp(p2 - 1, 0, COLS - 1);
+            break;
+        case 'A': // CUU — cursor up N
+            cursorY = std::max(cursorY - p1, 0);
+            break;
+        case 'B': // CUD — cursor down N
+            cursorY = std::min(cursorY + p1, ROWS - 1);
+            break;
+        case 'C': // CUF — cursor right N
+            cursorX = std::min(cursorX + p1, COLS - 1);
+            break;
+        case 'D': // CUB — cursor left N
+            cursorX = std::max(cursorX - p1, 0);
+            break;
+        case 'G': // CHA — cursor horizontal absolute (1-based)
+            cursorX = std::clamp(p1 - 1, 0, COLS - 1);
+            break;
+        case 'd': // VPA — cursor vertical absolute (1-based)
+            cursorY = std::clamp(p1 - 1, 0, ROWS - 1);
+            break;
+        case 'J': // ED — erase in display
+            if (p1z == 0)
+            {
+                memset(buffer[cursorY] + cursorX, ' ', COLS - cursorX);
+                for (int r = cursorY + 1; r < ROWS; r++) memset(buffer[r], ' ', COLS);
+            }
+            else if (p1z == 1)
+            {
+                for (int r = 0; r < cursorY; r++) memset(buffer[r], ' ', COLS);
+                memset(buffer[cursorY], ' ', cursorX + 1);
+            }
+            else
+            {
+                clear();
+            }
+            break;
+        case 'K': // EL — erase in line
+            if (p1z == 0)
+                memset(buffer[cursorY] + cursorX, ' ', COLS - cursorX);
+            else if (p1z == 1)
+                memset(buffer[cursorY], ' ', cursorX + 1);
+            else
+                memset(buffer[cursorY], ' ', COLS);
+            break;
+        case 'L': // IL — insert N lines (scroll region down)
+        {
+            int n = std::min(p1, ROWS - cursorY);
+            for (int r = ROWS - 1; r >= cursorY + n; r--)
+                memcpy(buffer[r], buffer[r - n], COLS);
+            for (int r = cursorY; r < cursorY + n && r < ROWS; r++)
+                memset(buffer[r], ' ', COLS);
+            break;
+        }
+        case 'M': // DL — delete N lines (scroll region up)
+        {
+            int n = std::min(p1, ROWS - cursorY);
+            for (int r = cursorY; r < ROWS - n; r++)
+                memcpy(buffer[r], buffer[r + n], COLS);
+            for (int r = ROWS - n; r < ROWS; r++)
+                memset(buffer[r], ' ', COLS);
+            break;
+        }
+        case 'P': // DCH — delete N characters at cursor
+        {
+            int n = std::min(p1, COLS - cursorX);
+            memmove(buffer[cursorY] + cursorX,
+                    buffer[cursorY] + cursorX + n,
+                    COLS - cursorX - n);
+            memset(buffer[cursorY] + COLS - n, ' ', n);
+            break;
+        }
+        case '@': // ICH — insert N blank characters at cursor
+        {
+            int n = std::min(p1, COLS - cursorX);
+            memmove(buffer[cursorY] + cursorX + n,
+                    buffer[cursorY] + cursorX,
+                    COLS - cursorX - n);
+            memset(buffer[cursorY] + cursorX, ' ', n);
+            break;
+        }
+        // Ignored: color/attributes, mode set/reset, scroll region, cursor save/restore, DSR
+        case 'm': case 'h': case 'l': case 'r':
+        case 's': case 'u': case 'n':
+            break;
+        default:
+            break;
+        }
+        escState = EscState::NORMAL;
+        return;
+    }
+
     default:
         break;
     }
@@ -109,66 +663,65 @@ void TerminalState::putChar(char ch)
     case 0x1B: // ESC — start of escape sequence
         escState = EscState::ESC;
         return;
-    case 0x0D: // CR — move to start of line
+    case 0x0D: // CR
         cursorX = 0;
         return;
-    case 0x0A: // LF — move down one line, scroll if at bottom
+    case 0x0A: // LF — scroll if at bottom
         cursorY++;
-        if (cursorY >= ROWS)
-        {
-            for (int r = 0; r < ROWS - 1; r++)
-                memcpy(buffer[r], buffer[r + 1], COLS);
-            memset(buffer[ROWS - 1], ' ', COLS);
-            cursorY = ROWS - 1;
-        }
+        if (cursorY >= ROWS) TermScroll(*this);
         return;
     case 0x08: // BS — cursor left
-        if (cursorX > 0)
-            cursorX--;
+        if (cursorX > 0) cursorX--;
         return;
     case 0x0B: // ^K — cursor up (ADM-3A)
-        if (cursorY > 0)
-            cursorY--;
+        if (cursorY > 0) cursorY--;
         return;
     case 0x18: // ^X — cursor down (WordStar)
-        if (cursorY < ROWS - 1)
-            cursorY++;
+        if (cursorY < ROWS - 1) cursorY++;
         return;
-    case 0x0C: // ^L — form feed / clear screen and home cursor
+    case 0x0C: // ^L — clear screen
         clear();
         return;
-    case 0x1A: // ^Z — clear screen and home cursor
+    case 0x1A: // ^Z — clear screen
         clear();
         return;
     case 0x19: // ^Y — erase to end of line
         memset(buffer[cursorY] + cursorX, ' ', COLS - cursorX);
         return;
-    case 0x07: // ^G — bell (ignored)
+    case 0x07: // ^G — bell, ignored
         return;
     default:
         break;
     }
 
     // ── Printable character ───────────────────────────────────────────────
-    if (b >= 0x20 && b < 0x7F)
+    // Strip bit 7: WordStar/DataStar set it for reverse-video highlighting.
+    uint8_t glyph = b & 0x7F;
+    if (glyph >= 0x20 && glyph < 0x7F)
     {
-        buffer[cursorY][cursorX] = ch;
+        buffer[cursorY][cursorX] = (char)glyph;
         if (++cursorX >= COLS)
         {
             cursorX = 0;
             cursorY++;
-            if (cursorY >= ROWS)
-            {
-                for (int r = 0; r < ROWS - 1; r++)
-                    memcpy(buffer[r], buffer[r + 1], COLS);
-                memset(buffer[ROWS - 1], ' ', COLS);
-                cursorY = ROWS - 1;
-            }
+            if (cursorY >= ROWS) TermScroll(*this);
         }
     }
 }
 
 // ── FCB helpers ──────────────────────────────────────────────────────────────
+
+// Resolve the host directory for a given FCB: byte 0 == 0 → current drive,
+// 1–4 → A:–D: explicitly.  All BDOS file functions must use this so that
+// programs which hard-code a drive in the FCB (e.g. CC.COM writing to B:)
+// land in the correct host subdirectory instead of always in currentDiskDir().
+static const std::string &FCBDiskDir(intel8080 *cpu, CPMState &cpm, uint16_t fcbAddr)
+{
+    uint8_t drv = cpu->memory[fcbAddr];
+    if (drv == 0)
+        return cpm.currentDiskDir();
+    return cpm.driveDir(drv - 1);
+}
 
 static std::string FCBToHostName(intel8080 *cpu, uint16_t fcbAddr)
 {
@@ -187,7 +740,7 @@ static std::string FCBToHostName(intel8080 *cpu, uint16_t fcbAddr)
 
 static long FCBFileOffset(intel8080 *cpu, uint16_t fcbAddr)
 {
-    uint16_t extent = (uint16_t)cpu->memory[fcbAddr + FCB_EX] | ((uint16_t)cpu->memory[fcbAddr + FCB_S2] << 8);
+    uint32_t extent = (uint32_t)cpu->memory[fcbAddr + FCB_S2] * 32u + cpu->memory[fcbAddr + FCB_EX];
     return ((long)extent * 128 + cpu->memory[fcbAddr + FCB_CR]) * 128;
 }
 
@@ -210,10 +763,12 @@ static void FCBAdvanceRecord(intel8080 *cpu, uint16_t fcbAddr)
 void CPMInit(intel8080 *cpu, CPMState &cpm, const std::string &diskDir)
 {
     cpm.diskDirs[0] = diskDir;
-    cpm.diskDirs[1] = diskDir + "/b";
-    cpm.diskDirs[2] = diskDir + "/c";
-    cpm.diskDirs[3] = diskDir + "/d";
-    for (int i = 1; i < 4; i++)
+    for (int i = 1; i < MAX_DRIVES; i++) {
+        char ltr[2] = { (char)('a' + i), '\0' };
+        cpm.diskDirs[i] = diskDir + "/" + ltr;
+    }
+    // auto-create B:, C:, D: subdirectories (same behaviour as before).
+    for (int i = 1; i <= 3; i++)
         mkdir(cpm.diskDirs[i].c_str(), 0755);
     cpm.dmaAddress = 0x0080;
     cpm.currentDrive = 0;
@@ -225,10 +780,19 @@ void CPMInit(intel8080 *cpu, CPMState &cpm, const std::string &diskDir)
     cpm.ccpLine.clear();
     cpm.fcbSlotMap.clear();
 
-    // 0x0000: JMP 0x0000 — warm-boot vector (program exit returns here)
+    // 0x0000: JMP BIOS_ADDR (WBOOT) — warm-boot vector.
+    // 0x0001-0x0002 holds the BIOS base address so programs that do
+    // LHLD 0x0001 to locate the BIOS jump table find the real stubs.
     cpu->memory[0x0000] = 0xC3;
-    cpu->memory[0x0001] = 0x00;
-    cpu->memory[0x0002] = 0x00;
+    cpu->memory[0x0001] = (uint8_t)(BIOS_ADDR & 0xFF);
+    cpu->memory[0x0002] = (uint8_t)(BIOS_ADDR >> 8);
+
+    // BIOS stub table: 16 entries × 3 bytes each, each slot starts with RET
+    // (intercepted by BIOSCall before execution).
+    // Order: WBOOT CONST CONIN CONOUT LIST PUNCH READER HOME
+    //        SELDSK SETTRK SETSEC SETDMA READ WRITE LISTST SECTRAN
+    for (int i = 0; i < 16; i++)
+        cpu->memory[BIOS_ADDR + i * 3] = 0xC9; // RET
 
     // 0x0005: BDOS entry stub — RET, intercepted before execution.
     cpu->memory[0x0005] = 0xC9;
@@ -301,6 +865,10 @@ void CPMCloseAllFiles(CPMState &cpm)
         }
     }
     cpm.fcbSlotMap.clear();
+
+    if (cpm.readerFp)  { fclose(cpm.readerFp);  cpm.readerFp  = nullptr; }
+    if (cpm.punchFp)   { fclose(cpm.punchFp);    cpm.punchFp   = nullptr; }
+    if (cpm.printerFp) { fclose(cpm.printerFp);  cpm.printerFp = nullptr; }
 }
 
 // ── BDOS function implementations ────────────────────────────────────────────
@@ -324,14 +892,14 @@ static void BDOS_ConsoleInput(intel8080 *cpu, CPMState &cpm)
 {
     // Queue non-empty guaranteed by the early-return guard in BDOSCall.
     uint8_t ch = cpm.terminal.inputQueue.front();
-    cpm.terminal.inputQueue.erase(cpm.terminal.inputQueue.begin());
+    cpm.terminal.inputQueue.pop_front();
     cpu->A = ch;
     cpm.terminal.putChar((char)ch); // BDOS echoes the character
 }
 
 static void BDOS_ConsoleOutput(intel8080 *cpu, CPMState &cpm)
 {
-    cpm.terminal.putChar((char)cpu->E);
+    cpm.consoleOut((char)cpu->E);
 }
 
 // Direct Console I/O (fn 6):
@@ -349,7 +917,7 @@ static void BDOS_DirectConsoleIO(intel8080 *cpu, CPMState &cpm)
         else
         {
             cpu->A = cpm.terminal.inputQueue.front();
-            cpm.terminal.inputQueue.erase(cpm.terminal.inputQueue.begin());
+            cpm.terminal.inputQueue.pop_front();
         }
     }
     else if (cpu->E == 0xFE)
@@ -358,7 +926,7 @@ static void BDOS_DirectConsoleIO(intel8080 *cpu, CPMState &cpm)
     }
     else
     {
-        cpm.terminal.putChar((char)cpu->E);
+        cpm.consoleOut((char)cpu->E);
     }
 }
 
@@ -366,11 +934,11 @@ static void BDOS_PrintString(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t addr = ((uint16_t)cpu->D << 8) | cpu->E;
     size_t printed = 0;
-    const size_t MAX_PRINT = 4096; // Limite razoável para string impresa
+    const size_t MAX_PRINT = 4096;
 
     while (addr < 65536 && cpu->memory[addr] != '$' && printed < MAX_PRINT)
     {
-        cpm.terminal.putChar((char)cpu->memory[addr++]);
+        cpm.consoleOut((char)cpu->memory[addr++]);
         printed++;
     }
 }
@@ -391,6 +959,7 @@ static void BDOS_ResetDisk(intel8080 * /*cpu*/, CPMState &cpm)
 {
     cpm.dmaAddress = 0x0080;
     cpm.currentDrive = 0;
+    cpm.writeProtectedDrives = 0; // reset clears all write-protects
 }
 
 static void BDOS_SelectDisk(intel8080 *cpu, CPMState &cpm)
@@ -402,11 +971,45 @@ static void BDOS_SelectDisk(intel8080 *cpu, CPMState &cpm)
 static void BDOS_OpenFile(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    std::string path = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr);
-    int slot = AllocFileSlot();
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        char name[11]; FCBGetName(cpu, fcbAddr, name);
+        int entIdx = DskFindEntry(dsk, (uint8_t)cpm.currentUser, name, 0);
+        if (entIdx < 0) { cpu->H = 0x01; cpu->A = 0xFF; return; } // file not found
+        uint8_t e[32];
+        dsk->dskRead(dsk->dirByteOff(entIdx), e, 32);
+        int slot = AllocFileSlot();
+        if (!slot) { cpu->H = 0xFF; cpu->A = 0xFF; return; } // no FCB slots
+        openFiles[slot].fp = nullptr;
+        openFiles[slot].dsk = dsk;
+        openFiles[slot].readOnly = dsk->readOnly || (e[9] & 0x80) != 0;
+        memcpy(openFiles[slot].name, name, 11);
+        cpm.fcbSlotMap[fcbAddr] = slot;
+        cpu->memory[fcbAddr + FCB_EX] = cpu->memory[fcbAddr + FCB_CR] = 0;
+        cpu->memory[fcbAddr + FCB_EXT]     = (cpu->memory[fcbAddr + FCB_EXT]     & 0x7F) | (e[9]  & 0x80);
+        cpu->memory[fcbAddr + FCB_EXT + 1] = (cpu->memory[fcbAddr + FCB_EXT + 1] & 0x7F) | (e[10] & 0x80);
+        cpu->A = 0x00;
+        return;
+    }
+    std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
+
+    // If this path is already open (e.g. ASM.COM opens the same file twice), rewind and reuse.
+    int slot = FindOpenSlotByPath(path.c_str());
+    if (slot)
+    {
+        fseek(openFiles[slot].fp, 0, SEEK_SET);
+        cpm.fcbSlotMap[fcbAddr] = slot;
+        cpu->memory[fcbAddr + FCB_EX] = cpu->memory[fcbAddr + FCB_CR] = 0;
+        cpu->memory[fcbAddr + FCB_S2] = 0;
+        FCBSetRecordCount(cpu, fcbAddr, openFiles[slot].fp);
+        cpu->A = 0x00;
+        return;
+    }
+
+    slot = AllocFileSlot();
     if (!slot)
     {
-        cpu->A = 0xFF;
+        cpu->H = 0xFF; cpu->A = 0xFF; // no FCB slots
         return;
     }
     FILE *fp = fopen(path.c_str(), "rb+");
@@ -418,12 +1021,21 @@ static void BDOS_OpenFile(intel8080 *cpu, CPMState &cpm)
     }
     if (!fp)
     {
-        cpu->A = 0xFF;
+        cpu->H = 0x01; cpu->A = 0xFF; // file not found
         return;
     }
-    openFiles[slot] = {fp, ro};
+    openFiles[slot].fp = fp;
+    openFiles[slot].dsk = nullptr;
+    openFiles[slot].readOnly = ro;
+    strncpy(openFiles[slot].hostPath, path.c_str(), sizeof(openFiles[slot].hostPath) - 1);
     cpm.fcbSlotMap[fcbAddr] = slot;
     cpu->memory[fcbAddr + FCB_EX] = cpu->memory[fcbAddr + FCB_CR] = 0;
+    cpu->memory[fcbAddr + FCB_S2] = 0;
+    if (ro) cpu->memory[fcbAddr + FCB_EXT + 0] |=  0x80;
+    else    cpu->memory[fcbAddr + FCB_EXT + 0] &= ~0x80;
+    if (HostGetSys(path)) cpu->memory[fcbAddr + FCB_EXT + 1] |=  0x80;
+    else                  cpu->memory[fcbAddr + FCB_EXT + 1] &= ~0x80;
+    FCBSetRecordCount(cpu, fcbAddr, fp);
     cpu->A = 0x00;
 }
 
@@ -431,16 +1043,25 @@ static void BDOS_CloseFile(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
     auto it = cpm.fcbSlotMap.find(fcbAddr);
-    if (it != cpm.fcbSlotMap.end())
+    if (it == cpm.fcbSlotMap.end())
     {
-        int slot = it->second;
-        if (slot > 0 && slot < MAX_OPEN_FILES && openFiles[slot].fp)
-        {
-            fclose(openFiles[slot].fp);
-            openFiles[slot] = {};
-        }
-        cpm.fcbSlotMap.erase(it);
+        // Pro Pascal v2.1 closes files that exist but were never opened by this FCB.
+        std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0)
+            cpu->A = 0x00; // file exists — treat as success
+        else
+            { cpu->H = 0xFF; cpu->A = 0xFF; } // file not found
+        return;
     }
+    int slot = it->second;
+    if (slot > 0 && slot < MAX_OPEN_FILES)
+    {
+        if (openFiles[slot].fp) { fclose(openFiles[slot].fp); }
+        // DSK files: image FILE* stays open; just clear the slot.
+        openFiles[slot] = {};
+    }
+    cpm.fcbSlotMap.erase(it);
     cpu->A = 0x00;
 }
 
@@ -476,8 +1097,9 @@ static bool FCBMatchesFile(intel8080 *cpu, uint16_t fcbAddr, const std::string &
     return true;
 }
 
-// Write a fake 32-byte CP/M directory entry for `filename` into the DMA buffer.
-static void FillDMAWithEntry(intel8080 *cpu, CPMState &cpm, const std::string &filename)
+// Write a 32-byte CP/M directory entry for `filename` into the DMA buffer and DIRBUF.
+// attr: bit0 = R/O (sets bit 7 of ext[0]), bit1 = SYS (sets bit 7 of ext[1]).
+static void FillDMAWithEntry(intel8080 *cpu, CPMState &cpm, const std::string &filename, uint8_t attr = 0)
 {
     auto dot = filename.rfind('.');
     std::string namePart = (dot != std::string::npos) ? filename.substr(0, dot) : filename;
@@ -489,48 +1111,97 @@ static void FillDMAWithEntry(intel8080 *cpu, CPMState &cpm, const std::string &f
         dma[1 + i] = (i < (int)namePart.size()) ? (uint8_t)namePart[i] : ' ';
     for (int i = 0; i < 3; i++)
         dma[9 + i] = (i < (int)extPart.size()) ? (uint8_t)extPart[i] : ' ';
+    if (attr & 0x01) dma[9]  |= 0x80; // R/O flag
+    if (attr & 0x02) dma[10] |= 0x80; // SYS flag
+    // Mirror into DIRBUF so programs that read it directly get valid data.
+    if (cpm.dmaAddress != DIRBUF_ADDR)
+        memcpy(&cpu->memory[DIRBUF_ADDR], dma, 32);
 }
 
 static void BDOS_SearchFirst(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    cpm.searchResults.clear();
-    cpm.searchIndex = 0;
-    DIR *dir = opendir(cpm.currentDiskDir().c_str());
-    if (!dir)
+    SearchContext &ctx = cpm.searchContexts[fcbAddr];
+    ctx.results.clear();
+    ctx.currentIndex = 0;
+
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        char pat[11]; FCBGetName(cpu, fcbAddr, pat);
+        uint8_t e[32];
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5 || e[0] != (uint8_t)cpm.currentUser) continue;
+            if (e[12] != 0) continue; // only first extent
+            bool match = true;
+            for (int j = 0; j < 11; j++)
+                if (pat[j] != '?' && (e[1+j] & 0x7F) != (uint8_t)pat[j]) { match = false; break; }
+            if (!match) continue;
+            char nm[9] = {}, ex[4] = {};
+            for (int j = 0; j < 8; j++) nm[j] = (char)(e[1+j] & 0x7F);
+            for (int j = 0; j < 3; j++) ex[j] = (char)(e[9+j] & 0x7F);
+            std::string sn(nm), se(ex);
+            while (!sn.empty() && sn.back() == ' ') sn.pop_back();
+            while (!se.empty() && se.back() == ' ') se.pop_back();
+            uint8_t fileAttr = 0;
+            if (e[9]  & 0x80) fileAttr |= 0x01; // R/O
+            if (e[10] & 0x80) fileAttr |= 0x02; // SYS
+            ctx.results.push_back({se.empty() ? sn : sn + "." + se, fileAttr});
+        }
+    } else {
+        const std::string& dirPath = FCBDiskDir(cpu, cpm, fcbAddr);
+        DIR *dir = opendir(dirPath.c_str());
+        if (!dir)
+        {
+            cpm.searchContexts.erase(fcbAddr);
+            cpu->H = 0xFF; cpu->A = 0xFF; // cannot open directory
+            return;
+        }
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != nullptr)
+        {
+            if (ent->d_name[0] == '.')
+                continue;
+            std::string upper = ent->d_name;
+            for (char &c : upper)
+                c = (char)toupper((unsigned char)c);
+            if (!FCBMatchesFile(cpu, fcbAddr, upper))
+                continue;
+            std::string fullPath = dirPath + "/" + ent->d_name;
+            struct stat fst;
+            uint8_t fileAttr = 0;
+            if (stat(fullPath.c_str(), &fst) == 0 && !(fst.st_mode & S_IWUSR))
+                fileAttr |= 0x01; // R/O
+            if (HostGetSys(fullPath))
+                fileAttr |= 0x02; // SYS
+            ctx.results.push_back({upper, fileAttr});
+        }
+        closedir(dir);
+    }
+
+    if (ctx.results.empty())
     {
-        cpu->A = 0xFF;
+        cpm.searchContexts.erase(fcbAddr);
+        cpu->H = 0x01; cpu->A = 0xFF; // no files found
         return;
     }
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != nullptr)
-    {
-        if (ent->d_name[0] == '.')
-            continue;
-        std::string upper = ent->d_name;
-        for (char &c : upper)
-            c = (char)toupper((unsigned char)c);
-        if (FCBMatchesFile(cpu, fcbAddr, upper))
-            cpm.searchResults.push_back(upper);
-    }
-    closedir(dir);
-    if (cpm.searchResults.empty())
-    {
-        cpu->A = 0xFF;
-        return;
-    }
-    FillDMAWithEntry(cpu, cpm, cpm.searchResults[cpm.searchIndex++]);
+    const auto& first = ctx.results[ctx.currentIndex++];
+    FillDMAWithEntry(cpu, cpm, first.first, first.second);
     cpu->A = 0x00;
 }
 
 static void BDOS_SearchNext(intel8080 *cpu, CPMState &cpm)
 {
-    if (cpm.searchIndex >= (int)cpm.searchResults.size())
+    uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
+    auto it = cpm.searchContexts.find(fcbAddr);
+    if (it == cpm.searchContexts.end() || it->second.currentIndex >= (int)it->second.results.size())
     {
-        cpu->A = 0xFF;
+        cpu->H = 0x01; cpu->A = 0xFF; // no more files
         return;
     }
-    FillDMAWithEntry(cpu, cpm, cpm.searchResults[cpm.searchIndex++]);
+    SearchContext &ctx = it->second;
+    const auto& next = ctx.results[ctx.currentIndex++];
+    FillDMAWithEntry(cpu, cpm, next.first, next.second);
     cpu->A = 0x00;
 }
 
@@ -539,20 +1210,31 @@ static void BDOS_ReadSequential(intel8080 *cpu, CPMState &cpm)
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
     auto it = cpm.fcbSlotMap.find(fcbAddr);
     int slot = (it != cpm.fcbSlotMap.end()) ? it->second : 0;
-    if (slot <= 0 || !openFiles[slot].fp)
-    {
-        cpu->A = 0x09;
+    if (slot <= 0) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
+
+    if (openFiles[slot].dsk) {
+        uint8_t buf[128];
+        cpu->A = DskReadRec(openFiles[slot].dsk, (uint8_t)cpm.currentUser,
+                            openFiles[slot].name,
+                            cpu->memory[fcbAddr + FCB_EX],
+                            cpu->memory[fcbAddr + FCB_S2],
+                            cpu->memory[fcbAddr + FCB_CR], buf);
+        if (cpu->A == 0x00) {
+            memcpy(&cpu->memory[cpm.dmaAddress], buf, 128);
+            FCBAdvanceRecord(cpu, fcbAddr);
+        } else {
+            cpu->H = cpu->A; // 0x01 = EOF
+        }
         return;
     }
+
+    if (!openFiles[slot].fp) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
     fseek(openFiles[slot].fp, FCBFileOffset(cpu, fcbAddr), SEEK_SET);
-    uint8_t buf[128] = {};
-    if (!fread(buf, 1, 128, openFiles[slot].fp))
-    {
-        cpu->A = 0x01;
-        return;
-    }
-    for (int i = 0; i < 128; i++)
-        cpu->memory[cpm.dmaAddress + i] = buf[i];
+    uint8_t buf[128];
+    memset(buf, 0x1A, 128);
+    size_t nread = fread(buf, 1, 128, openFiles[slot].fp);
+    if (nread == 0) { cpu->H = 0x01; cpu->A = 0x01; return; } // EOF
+    memcpy(&cpu->memory[cpm.dmaAddress], buf, 128);
     FCBAdvanceRecord(cpu, fcbAddr);
     cpu->A = 0x00;
 }
@@ -562,63 +1244,182 @@ static void BDOS_WriteSequential(intel8080 *cpu, CPMState &cpm)
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
     auto it = cpm.fcbSlotMap.find(fcbAddr);
     int slot = (it != cpm.fcbSlotMap.end()) ? it->second : 0;
-    if (slot <= 0 || !openFiles[slot].fp)
-    {
-        cpu->A = 0x09;
+    if (slot <= 0) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
+
+    if (openFiles[slot].dsk) {
+        cpu->A = DskWriteRec(openFiles[slot].dsk, (uint8_t)cpm.currentUser,
+                             openFiles[slot].name,
+                             cpu->memory[fcbAddr + FCB_EX],
+                             cpu->memory[fcbAddr + FCB_S2],
+                             cpu->memory[fcbAddr + FCB_CR],
+                             &cpu->memory[cpm.dmaAddress]);
+        if (cpu->A == 0x00) FCBAdvanceRecord(cpu, fcbAddr);
+        else cpu->H = (cpu->A == 0xFF) ? 0x07 : cpu->A; // 0xFF=R/O, 0x02=full
         return;
     }
-    if (openFiles[slot].readOnly)
-    {
-        cpu->A = 0xFF;
-        return;
-    }
+
+    if (!openFiles[slot].fp) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
+    if (openFiles[slot].readOnly) { cpu->H = 0x07; cpu->A = 0xFF; return; } // write-protected
     fseek(openFiles[slot].fp, FCBFileOffset(cpu, fcbAddr), SEEK_SET);
     if (fwrite(&cpu->memory[cpm.dmaAddress], 1, 128, openFiles[slot].fp) < 128)
     {
-        cpu->A = 0x02;
+        cpu->H = 0x02; cpu->A = 0x02; // disk full
         return;
     }
     fflush(openFiles[slot].fp);
     FCBAdvanceRecord(cpu, fcbAddr);
+    FCBSetRecordCount(cpu, fcbAddr, openFiles[slot].fp); // Whitesmith C A80.COM requires this
     cpu->A = 0x00;
 }
 
 static void BDOS_MakeFile(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    std::string path = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr);
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        if (dsk->readOnly) { cpu->H = 0x07; cpu->A = 0xFF; return; } // write-protected
+        char name[11]; FCBGetName(cpu, fcbAddr, name);
+        // Erase any existing entries for this filename first.
+        uint8_t e[32];
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5 || e[0] != (uint8_t)cpm.currentUser) continue;
+            bool match = true;
+            for (int j = 0; j < 11; j++)
+                if ((e[1+j] & 0x7F) != (uint8_t)name[j]) { match = false; break; }
+            if (match) { e[0] = 0xE5; dsk->dskWrite(dsk->dirByteOff(i), e, 32); }
+        }
+        int idx = DskAllocDir(dsk);
+        if (idx < 0) { cpu->H = 0x05; cpu->A = 0xFF; return; } // directory full
+        memset(e, 0, 32);
+        e[0] = (uint8_t)cpm.currentUser;
+        for (int j = 0; j < 11; j++) e[1+j] = (uint8_t)name[j];
+        dsk->dskWrite(dsk->dirByteOff(idx), e, 32);
+        dsk->cache.flush();
+        int slot = AllocFileSlot();
+        if (!slot) { cpu->H = 0xFF; cpu->A = 0xFF; return; } // no FCB slots
+        openFiles[slot].fp = nullptr;
+        openFiles[slot].dsk = dsk;
+        openFiles[slot].readOnly = false;
+        memcpy(openFiles[slot].name, name, 11);
+        cpm.fcbSlotMap[fcbAddr] = slot;
+        cpu->memory[fcbAddr + FCB_EX] = cpu->memory[fcbAddr + FCB_CR] = 0;
+        cpu->A = 0x00;
+        return;
+    }
+    std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
     int slot = AllocFileSlot();
     if (!slot)
     {
-        cpu->A = 0xFF;
+        cpu->H = 0xFF; cpu->A = 0xFF; // no FCB slots
         return;
     }
     FILE *fp = fopen(path.c_str(), "wb+");
     if (!fp)
     {
-        cpu->A = 0xFF;
+        cpu->H = 0xFF; cpu->A = 0xFF; // cannot create file
         return;
     }
-    openFiles[slot] = {fp, false};
+    openFiles[slot].fp = fp;
+    openFiles[slot].dsk = nullptr;
+    openFiles[slot].readOnly = false;
+    strncpy(openFiles[slot].hostPath, path.c_str(), sizeof(openFiles[slot].hostPath) - 1);
     cpm.fcbSlotMap[fcbAddr] = slot;
     cpu->memory[fcbAddr + FCB_EX] = cpu->memory[fcbAddr + FCB_CR] = 0;
+    cpu->memory[fcbAddr + FCB_S2] = 0;
+    cpu->memory[fcbAddr + FCB_RC] = 0;
     cpu->A = 0x00;
 }
 
 static void BDOS_EraseFile(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    std::string path = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr);
-    cpu->A = (remove(path.c_str()) == 0) ? 0x00 : 0xFF;
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        if (dsk->readOnly) { cpu->H = 0x07; cpu->A = 0xFF; return; } // write-protected
+        char pat[11]; FCBGetName(cpu, fcbAddr, pat);
+        uint8_t e[32]; bool erased = false;
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5 || e[0] != (uint8_t)cpm.currentUser) continue;
+            bool match = true;
+            for (int j = 0; j < 11; j++)
+                if (pat[j] != '?' && (e[1+j] & 0x7F) != (uint8_t)pat[j]) { match = false; break; }
+            if (match) {
+                e[0] = 0xE5;
+                dsk->dskWrite(dsk->dirByteOff(i), e, 32);
+                erased = true;
+            }
+        }
+        if (erased) dsk->cache.flush();
+        if (!erased) cpu->H = 0x01; // file not found
+        cpu->A = erased ? 0x00 : 0xFF;
+        return;
+    }
+    std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
+    if (remove(path.c_str()) != 0) { cpu->H = 0x01; cpu->A = 0xFF; } // file not found
+    else cpu->A = 0x00;
 }
 
 // Rename FCB layout: bytes 1-11 = old name, bytes 17-27 = new name.
 static void BDOS_RenameFile(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    std::string oldPath = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr);
-    std::string newPath = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr + 16);
-    cpu->A = (rename(oldPath.c_str(), newPath.c_str()) == 0) ? 0x00 : 0xFF;
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        if (dsk->readOnly) { cpu->H = 0x07; cpu->A = 0xFF; return; } // write-protected
+        char oldName[11], newName[11];
+        FCBGetName(cpu, fcbAddr, oldName);
+        FCBGetName(cpu, fcbAddr + 16, newName);
+        uint8_t e[32]; bool renamed = false;
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5 || e[0] != (uint8_t)cpm.currentUser) continue;
+            bool match = true;
+            for (int j = 0; j < 11; j++)
+                if ((e[1+j] & 0x7F) != (uint8_t)oldName[j]) { match = false; break; }
+            if (match) {
+                for (int j = 0; j < 11; j++) e[1+j] = (uint8_t)newName[j];
+                dsk->dskWrite(dsk->dirByteOff(i), e, 32);
+                renamed = true;
+            }
+        }
+        if (renamed) dsk->cache.flush();
+        if (!renamed) cpu->H = 0x01; // file not found
+        cpu->A = renamed ? 0x00 : 0xFF;
+        return;
+    }
+    std::string oldPath = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
+    std::string newPath = FCBDiskDir(cpu, cpm, fcbAddr + 16) + "/" + FCBToHostName(cpu, fcbAddr + 16);
+    if (rename(oldPath.c_str(), newPath.c_str()) != 0) { cpu->H = 0x01; cpu->A = 0xFF; }
+    else cpu->A = 0x00;
+}
+
+// Translate absolute record number to DSK (ex, s2, cr) and update FCB.
+static void DskRandomIO(DskImage *dsk, intel8080 *cpu, CPMState &cpm,
+                        uint16_t fcbAddr, uint32_t rec, bool write)
+{
+    int rpe = dsk->recsPerBlock() * dsk->blockPtrs(); // records per extent (128)
+    uint8_t ex = (uint8_t)((rec / (uint32_t)rpe) & 0x1F);
+    uint8_t s2 = (uint8_t)((rec / (uint32_t)rpe) >> 5);
+    uint8_t cr = (uint8_t)(rec % (uint32_t)rpe);
+    uint8_t buf[128];
+    if (write) {
+        cpu->A = DskWriteRec(dsk, (uint8_t)cpm.currentUser,
+                             openFiles[cpm.fcbSlotMap[fcbAddr]].name,
+                             ex, s2, cr, &cpu->memory[cpm.dmaAddress]);
+    } else {
+        memset(buf, 0x1A, 128);
+        cpu->A = DskReadRec(dsk, (uint8_t)cpm.currentUser,
+                            openFiles[cpm.fcbSlotMap[fcbAddr]].name,
+                            ex, s2, cr, buf);
+        if (cpu->A == 0x00) memcpy(&cpu->memory[cpm.dmaAddress], buf, 128);
+    }
+    if (cpu->A == 0x00) {
+        cpu->memory[fcbAddr + FCB_EX] = ex;
+        cpu->memory[fcbAddr + FCB_S2] = s2;
+        cpu->memory[fcbAddr + FCB_CR] = cr;
+    }
 }
 
 // Random read: FCB bytes 33-35 (R0/R1/R2) encode the record number.
@@ -627,37 +1428,51 @@ static void BDOS_ReadRandom(intel8080 *cpu, CPMState &cpm)
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
     auto it = cpm.fcbSlotMap.find(fcbAddr);
     int slot = (it != cpm.fcbSlotMap.end()) ? it->second : 0;
-    if (slot <= 0 || !openFiles[slot].fp)
+
+    // dxForth 4.56: open/close/readrandom sequence — auto-open if not in slot map.
+    if (slot <= 0)
     {
-        cpu->A = 0x09;
+        std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
+        slot = FindOpenSlotByPath(path.c_str());
+        if (!slot)
+        {
+            slot = AllocFileSlot();
+            if (!slot) { cpu->H = 0x06; cpu->A = 0x06; return; }
+            bool ro = false;
+            FILE *fp = fopen(path.c_str(), "rb+");
+            if (!fp) { fp = fopen(path.c_str(), "rb"); ro = true; }
+            if (!fp) { cpu->H = 0x06; cpu->A = 0x06; return; }
+            openFiles[slot].fp = fp;
+            openFiles[slot].dsk = nullptr;
+            openFiles[slot].readOnly = ro;
+            strncpy(openFiles[slot].hostPath, path.c_str(), sizeof(openFiles[slot].hostPath) - 1);
+        }
+        cpm.fcbSlotMap[fcbAddr] = slot;
+    }
+
+    uint32_t rec = (uint32_t)cpu->memory[fcbAddr + 33]
+                 | ((uint32_t)cpu->memory[fcbAddr + 34] << 8)
+                 | ((uint32_t)cpu->memory[fcbAddr + 35] << 16);
+
+    if (openFiles[slot].dsk) {
+        DskRandomIO(openFiles[slot].dsk, cpu, cpm, fcbAddr, rec, false);
+        if (cpu->A != 0x00) cpu->H = cpu->A; // 0x01 = EOF
         return;
     }
 
-    uint32_t rec = (uint32_t)cpu->memory[fcbAddr + 33] | ((uint32_t)cpu->memory[fcbAddr + 34] << 8) | ((uint32_t)cpu->memory[fcbAddr + 35] << 16);
-
-    // Usar long long para evitar overflow na multiplicação
-    // Máximo seguro: ~4 GB em um arquivo
+    if (!openFiles[slot].fp) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
     long long offset = (long long)rec * 128;
-    if (offset < 0 || offset > 0x7FFFFFFF)
-    {                  // fseek suporta até ~2GB
-        cpu->A = 0x04; // Seek error (código de erro padrão CP/M)
-        return;
-    }
-
-    fseek(openFiles[slot].fp, (long)offset, SEEK_SET); // ✓ Seguro agora
-
-    uint8_t buf[128] = {};
-    if (!fread(buf, 1, 128, openFiles[slot].fp))
-    {
-        cpu->A = 0x01;
-        return;
-    }
-    for (int i = 0; i < 128; i++)
-        cpu->memory[cpm.dmaAddress + i] = buf[i];
-
-    uint16_t extent = rec / 128;
-    cpu->memory[fcbAddr + FCB_EX] = (uint8_t)(extent & 0xFF);
-    cpu->memory[fcbAddr + FCB_S2] = (uint8_t)(extent >> 8);
+    if (offset > 0x7FFFFFFF) { cpu->H = 0x04; cpu->A = 0x04; return; } // seek past end
+    fseek(openFiles[slot].fp, (long)offset, SEEK_SET);
+    uint8_t buf[128];
+    memset(buf, 0x1A, 128);
+    size_t nread = fread(buf, 1, 128, openFiles[slot].fp);
+    if (nread == 0) { cpu->H = 0x01; cpu->A = 0x01; return; } // EOF
+    for (int i = 0; i < 128; i++) cpu->memory[cpm.dmaAddress + i] = buf[i];
+    // CP/M spec: after random read, sequential position == same record (not +1).
+    uint32_t extent = rec / 128;
+    cpu->memory[fcbAddr + FCB_EX] = (uint8_t)(extent & 0x1F);
+    cpu->memory[fcbAddr + FCB_S2] = (uint8_t)(extent >> 5);
     cpu->memory[fcbAddr + FCB_CR] = (uint8_t)(rec % 128);
     cpu->A = 0x00;
 }
@@ -667,21 +1482,24 @@ static void BDOS_WriteRandom(intel8080 *cpu, CPMState &cpm)
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
     auto it = cpm.fcbSlotMap.find(fcbAddr);
     int slot = (it != cpm.fcbSlotMap.end()) ? it->second : 0;
-    if (slot <= 0 || !openFiles[slot].fp)
-    {
-        cpu->A = 0x09;
+    if (slot <= 0) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
+    if (openFiles[slot].readOnly) { cpu->H = 0x07; cpu->A = 0xFF; return; } // write-protected
+
+    uint32_t rec = (uint32_t)cpu->memory[fcbAddr + 33]
+                 | ((uint32_t)cpu->memory[fcbAddr + 34] << 8)
+                 | ((uint32_t)cpu->memory[fcbAddr + 35] << 16);
+
+    if (openFiles[slot].dsk) {
+        DskRandomIO(openFiles[slot].dsk, cpu, cpm, fcbAddr, rec, true);
+        if (cpu->A != 0x00) cpu->H = (cpu->A == 0xFF) ? 0x07 : cpu->A;
         return;
     }
-    if (openFiles[slot].readOnly)
-    {
-        cpu->A = 0xFF;
-        return;
-    }
-    uint32_t rec = (uint32_t)cpu->memory[fcbAddr + 33] | ((uint32_t)cpu->memory[fcbAddr + 34] << 8) | ((uint32_t)cpu->memory[fcbAddr + 35] << 16);
+
+    if (!openFiles[slot].fp) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
     fseek(openFiles[slot].fp, rec * 128LL, SEEK_SET);
     if (fwrite(&cpu->memory[cpm.dmaAddress], 1, 128, openFiles[slot].fp) < 128)
     {
-        cpu->A = 0x02;
+        cpu->H = 0x02; cpu->A = 0x02; // disk full
         return;
     }
     fflush(openFiles[slot].fp);
@@ -709,7 +1527,10 @@ static void BDOS_GetCurrentDisk(intel8080 *cpu, CPMState &cpm)
 
 static void BDOS_SetDMAAddress(intel8080 *cpu, CPMState &cpm)
 {
-    cpm.dmaAddress = ((uint16_t)cpu->D << 8) | cpu->E;
+    uint16_t addr = ((uint16_t)cpu->D << 8) | cpu->E;
+    if (addr >= 0x0080 && addr < BDOS_ADDR)
+        cpm.dmaAddress = addr;
+    // Invalid addresses are silently ignored (keep current DMA).
 }
 
 static void BDOS_UserNumber(intel8080 *cpu, CPMState &cpm)
@@ -725,34 +1546,151 @@ static void BDOS_UserNumber(intel8080 *cpu, CPMState &cpm)
     }
 }
 
-// ── Missing BDOS stubs ────────────────────────────────────────────────────────
-// fn 3: Reader Input — return 0x1A (CP/M EOF, no reader device)
-static void BDOS_ReaderInput(intel8080 *cpu, CPMState &) { cpu->A = 0x1A; }
-// fn 4: Punch Output — no-op (no punch device)
-static void BDOS_PunchOutput(intel8080 *, CPMState &) {}
-// fn 5: List Output — no-op (no printer device)
-static void BDOS_ListOutput(intel8080 *, CPMState &) {}
-// fn 7: Get IOBYTE — always 0 (CON: for all channels)
-static void BDOS_GetIOByte(intel8080 *cpu, CPMState &) { cpu->A = 0x00; }
-// fn 8: Set IOBYTE — ignored
-static void BDOS_SetIOByte(intel8080 *, CPMState &) {}
-// fn 24: Write Protect Disk — no-op
-static void BDOS_WriteProtectDisk(intel8080 *cpu, CPMState &) { cpu->A = 0x00; }
-// fn 27: Get Alloc Address — return HL = ALV_ADDR (dummy allocation vector)
-static void BDOS_GetAllocAddr(intel8080 *cpu, CPMState &)
+// ── Peripheral I/O ────────────────────────────────────────────────────────────
+// fn 3: Reader Input — read one byte from the configured reader file.
+// Returns 0x1A (Ctrl-Z / CP/M EOF) when no file is set or the file is exhausted.
+static void BDOS_ReaderInput(intel8080 *cpu, CPMState &cpm)
 {
+    if (!cpm.readerFp && !cpm.readerPath.empty())
+        cpm.readerFp = fopen(cpm.readerPath.c_str(), "rb");
+    if (cpm.readerFp) {
+        int ch = fgetc(cpm.readerFp);
+        cpu->A = (ch == EOF) ? 0x1A : (uint8_t)ch;
+    } else {
+        cpu->A = 0x1A;
+    }
+}
+// fn 4: Punch Output — append one byte to configured punch device or CPM.PUN.
+static void BDOS_PunchOutput(intel8080 *cpu, CPMState &cpm)
+{
+    if (!cpm.punchFp) {
+        std::string path = !cpm.punchPath.empty()
+            ? cpm.punchPath
+            : (!cpm.diskDirs[0].empty() ? cpm.diskDirs[0] : ".") + "/CPM.PUN";
+        cpm.punchFp = fopen(path.c_str(), "ab");
+    }
+    if (cpm.punchFp)
+        fputc(cpu->E, cpm.punchFp);
+}
+// fn 5: List Output — append one byte to configured printer device or CPM.LST.
+static void BDOS_ListOutput(intel8080 *cpu, CPMState &cpm)
+{
+    if (!cpm.printerFp) {
+        std::string path = !cpm.printerPath.empty()
+            ? cpm.printerPath
+            : (!cpm.diskDirs[0].empty() ? cpm.diskDirs[0] : ".") + "/CPM.LST";
+        cpm.printerFp = fopen(path.c_str(), "ab");
+    }
+    if (cpm.printerFp)
+        fputc(cpu->E, cpm.printerFp);
+}
+// fn 7: Get IOBYTE — read memory location 0x0003 (the standard CP/M IOBYTE).
+static void BDOS_GetIOByte(intel8080 *cpu, CPMState &) { cpu->A = cpu->memory[0x0003]; }
+// fn 8: Set IOBYTE — write E to memory location 0x0003.
+static void BDOS_SetIOByte(intel8080 *cpu, CPMState &) { cpu->memory[0x0003] = cpu->E; }
+// fn 24: Return Login Vector — bitmask of logged-in drives (bit 0 = A:, etc.)
+static void BDOS_LoginVector(intel8080 *cpu, CPMState &cpm)
+{
+    uint16_t mask = 0;
+    for (int i = 0; i < MAX_DRIVES; i++)
+        if (!cpm.diskDirs[i].empty() || (cpm.diskImages[i] && cpm.diskImages[i]->isOpen()))
+            mask |= (uint16_t)(1u << i);
+    if (mask == 0)
+        mask = 0x0001;
+    cpu->H = (uint8_t)(mask >> 8);
+    cpu->L = (uint8_t)(mask & 0xFF);
+    cpu->A = cpu->L;
+}
+// fn 28: Write Protect Disk — mark current drive as read-only until next reset.
+static void BDOS_WriteProtectDisk(intel8080 *cpu, CPMState &cpm)
+{
+    cpm.writeProtectedDrives |= (uint16_t)(1u << cpm.currentDrive);
+    cpu->A = 0x00;
+}
+// fn 27: Get Alloc Address — build allocation bitmap for the current drive.
+static void BDOS_GetAllocAddr(intel8080 *cpu, CPMState &cpm)
+{
+    uint8_t *alv = &cpu->memory[ALV_ADDR];
+    memset(alv, 0, 32);
+
+    DskImage *dsk = cpm.diskImages[cpm.currentDrive];
+    if (dsk && dsk->isOpen()) {
+        int dirBlks = ((dsk->drm + 1) * 32 + dsk->bytesPerBlock() - 1) / dsk->bytesPerBlock();
+        for (int i = 0; i < dirBlks; i++)
+            alv[i / 8] |= (uint8_t)(0x80u >> (i % 8));
+        uint8_t e[32]; int ptrs = dsk->blockPtrs();
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5) continue;
+            for (int j = 0; j < ptrs; j++) {
+                int blk = e[16+j];
+                if (blk > 0 && blk <= dsk->dsm)
+                    alv[blk / 8] |= (uint8_t)(0x80u >> (blk % 8));
+            }
+        }
+    } else {
+        alv[0] = 0xC0; // blocks 0-1 always reserved (directory area)
+        const std::string &dirPath = cpm.currentDiskDir();
+        constexpr int BLOCK_SIZE = 1024;
+        int nextBlock = 2;
+        DIR *dir = opendir(dirPath.c_str());
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != nullptr) {
+                if (ent->d_name[0] == '.') continue;
+                std::string fp = dirPath + "/" + ent->d_name;
+                struct stat st;
+                if (stat(fp.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                    int blks = (int)((st.st_size + BLOCK_SIZE - 1) / BLOCK_SIZE);
+                    for (int b = 0; b < blks && nextBlock < 243; b++, nextBlock++)
+                        alv[nextBlock / 8] |= (uint8_t)(0x80u >> (nextBlock % 8));
+                }
+            }
+            closedir(dir);
+        }
+    }
+
     cpu->H = (uint8_t)(ALV_ADDR >> 8);
     cpu->L = (uint8_t)(ALV_ADDR & 0xFF);
+    cpu->A = cpu->L;
 }
-// fn 29: Get R/O Vector — return HL = 0 (no write-protected drives)
-static void BDOS_GetROVector(intel8080 *cpu, CPMState &) { cpu->H = cpu->L = 0x00; }
-// fn 30: Set File Attributes — map R/O bit (FCB ext byte 9, bit 7) to host chmod
+// fn 29: Get R/O Vector — return bitmask of write-protected drives.
+static void BDOS_GetROVector(intel8080 *cpu, CPMState &cpm)
+{
+    cpu->H = (uint8_t)(cpm.writeProtectedDrives >> 8);
+    cpu->L = (uint8_t)(cpm.writeProtectedDrives & 0xFF);
+    cpu->A = cpu->L;
+}
+// fn 30: Set File Attributes — map R/O bit (FCB ext byte 9, bit 7)
 static void BDOS_SetFileAttribs(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    std::string path = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr);
-    bool ro = (cpu->memory[fcbAddr + FCB_EXT] & 0x80) != 0;
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        char name[11]; FCBGetName(cpu, fcbAddr, name);
+        bool ro  = (cpu->memory[fcbAddr + FCB_EXT + 0] & 0x80) != 0;
+        bool sys = (cpu->memory[fcbAddr + FCB_EXT + 1] & 0x80) != 0;
+        uint8_t e[32];
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5) continue;
+            bool match = true;
+            for (int j = 0; j < 11; j++)
+                if ((e[1+j] & 0x7F) != (uint8_t)name[j]) { match = false; break; }
+            if (!match) continue;
+            if (ro)  e[9]  |= 0x80; else e[9]  &= 0x7F;
+            if (sys) e[10] |= 0x80; else e[10] &= 0x7F;
+            dsk->dskWrite(dsk->dirByteOff(i), e, 32);
+        }
+        dsk->cache.flush();
+        cpu->A = 0x00;
+        return;
+    }
+    std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
+    bool ro  = (cpu->memory[fcbAddr + FCB_EXT + 0] & 0x80) != 0;
+    bool sys = (cpu->memory[fcbAddr + FCB_EXT + 1] & 0x80) != 0;
     chmod(path.c_str(), ro ? 0444 : 0644);
+    HostSetSys(path, sys);
     cpu->A = 0x00;
 }
 // fn 31: Get Disk Parms — return HL = DPH_ADDR
@@ -760,18 +1698,136 @@ static void BDOS_GetDiskParms(intel8080 *cpu, CPMState &)
 {
     cpu->H = (uint8_t)(DPH_ADDR >> 8);
     cpu->L = (uint8_t)(DPH_ADDR & 0xFF);
+    cpu->A = cpu->L;
 }
 // fn 37: Reset Drive — no-op (drives don't have physical state)
 static void BDOS_ResetDrive(intel8080 *cpu, CPMState &) { cpu->H = cpu->L = cpu->A = 0x00; }
+// fn 38 (0x26): Access Drive — attempt to access a drive; stub returns success.
+static void BDOS_AccessDrive(intel8080 *cpu, CPMState &) { cpu->A = 0x00; }
+// fn 39 (0x27): Free Drive — release previously accessed drive; stub.
+static void BDOS_FreeDrive(intel8080 *, CPMState &) {}
+// fn 41 (0x29): Parse Filename — parse a string at DE into the FCB at HL.
+// Returns in A the number of characters consumed. Used by some programs (e.g. MBASIC).
+static void BDOS_ParseFilename(intel8080 *cpu, CPMState &)
+{
+    uint16_t srcAddr = ((uint16_t)cpu->D << 8) | cpu->E;
+    uint16_t fcbAddr = ((uint16_t)cpu->H << 8) | cpu->L;
+
+    memset(&cpu->memory[fcbAddr], 0, 36);
+    memset(&cpu->memory[fcbAddr + 1], ' ', 11);
+
+    int i = 0;
+    while (i < 256 && cpu->memory[srcAddr + i] == ' ')
+        i++; // skip leading spaces
+
+    // Collect the token (stop at space, control char, or '$').
+    std::string token;
+    while (i < 256 && cpu->memory[srcAddr + i] > 0x20 && cpu->memory[srcAddr + i] != '$')
+        token += (char)cpu->memory[srcAddr + i++];
+
+    size_t pos = 0;
+    if (token.size() >= 2 && token[1] == ':')
+    {
+        cpu->memory[fcbAddr] = (uint8_t)(toupper((unsigned char)token[0]) - 'A' + 1);
+        pos = 2;
+    }
+    std::string rest = token.substr(pos);
+    auto dot = rest.find('.');
+    std::string nm = (dot != std::string::npos) ? rest.substr(0, dot) : rest;
+    std::string ex = (dot != std::string::npos) ? rest.substr(dot + 1) : "";
+    for (size_t j = 0; j < std::min(nm.size(), (size_t)8); j++)
+        cpu->memory[fcbAddr + 1 + j] = (uint8_t)toupper((unsigned char)nm[j]);
+    for (size_t j = 0; j < std::min(ex.size(), (size_t)3); j++)
+        cpu->memory[fcbAddr + 9 + j] = (uint8_t)toupper((unsigned char)ex[j]);
+
+    cpu->A = (uint8_t)i;
+    cpu->L = (uint8_t)i;
+    cpu->H = 0;
+}
+// fn 40: Write Random with Zero Fill — like WriteRandom but gaps are zero-filled.
+// On Linux, fseek past EOF already produces a sparse file that reads as zeros,
+// so the only difference from WriteRandom is explicitly zeroing any unwritten gap.
+// For DSK images we treat it identically to WriteRandom (block gaps read as zero).
+static void BDOS_WriteRandomZeroFill(intel8080 *cpu, CPMState &cpm)
+{
+    uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
+    auto it = cpm.fcbSlotMap.find(fcbAddr);
+    int slot = (it != cpm.fcbSlotMap.end()) ? it->second : 0;
+    if (slot <= 0) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
+    if (openFiles[slot].readOnly) { cpu->H = 0x07; cpu->A = 0xFF; return; } // write-protected
+
+    uint32_t rec = (uint32_t)cpu->memory[fcbAddr + 33]
+                 | ((uint32_t)cpu->memory[fcbAddr + 34] << 8)
+                 | ((uint32_t)cpu->memory[fcbAddr + 35] << 16);
+
+    if (openFiles[slot].dsk) {
+        DskRandomIO(openFiles[slot].dsk, cpu, cpm, fcbAddr, rec, true);
+        if (cpu->A != 0x00) cpu->H = (cpu->A == 0xFF) ? 0x07 : cpu->A;
+        return;
+    }
+
+    if (!openFiles[slot].fp) { cpu->H = 0x06; cpu->A = 0x09; return; } // FCB not open
+    // Zero-fill any gap between current EOF and the target record.
+    fseek(openFiles[slot].fp, 0, SEEK_END);
+    long eof = ftell(openFiles[slot].fp);
+    long target = (long)rec * 128L;
+    if (target > eof)
+    {
+        static const uint8_t zeros[128] = {};
+        for (long pos = eof; pos < target; pos += 128)
+            fwrite(zeros, 1, 128, openFiles[slot].fp);
+    }
+    fseek(openFiles[slot].fp, target, SEEK_SET);
+    if (fwrite(&cpu->memory[cpm.dmaAddress], 1, 128, openFiles[slot].fp) < 128)
+    {
+        cpu->H = 0x02; cpu->A = 0x02; // disk full
+        return;
+    }
+    fflush(openFiles[slot].fp);
+    cpu->memory[fcbAddr + FCB_EX] = (uint8_t)((rec / 128) & 0x1F);
+    cpu->memory[fcbAddr + FCB_S2] = (uint8_t)(rec / (128 * 32));
+    cpu->memory[fcbAddr + FCB_CR] = (uint8_t)(rec % 128);
+    cpu->A = 0x00;
+}
 
 static void BDOS_ComputeFileSize(intel8080 *cpu, CPMState &cpm)
 {
     uint16_t fcbAddr = ((uint16_t)cpu->D << 8) | cpu->E;
-    std::string path = cpm.currentDiskDir() + "/" + FCBToHostName(cpu, fcbAddr);
+    DskImage *dsk = FCBGetDsk(cpu, cpm, fcbAddr);
+    if (dsk) {
+        char name[11]; FCBGetName(cpu, fcbAddr, name);
+        int rpb = dsk->recsPerBlock(), ptrs = dsk->blockPtrs();
+        int rpe = rpb * ptrs;
+        uint8_t e[32]; int maxExt = -1; uint32_t maxRecs = 0;
+        for (int i = 0; i < dsk->dirEntries(); i++) {
+            dsk->dskRead(dsk->dirByteOff(i), e, 32);
+            if (e[0] == 0xE5 || e[0] != (uint8_t)cpm.currentUser) continue;
+            bool match = true;
+            for (int j = 0; j < 11; j++)
+                if ((e[1+j] & 0x7F) != (uint8_t)name[j]) { match = false; break; }
+            if (!match) continue;
+            int extNum = (int)(e[12] & 0x1F) + ((int)(e[14] & 0x3F) << 5);
+            if (extNum > maxExt) {
+                maxExt = extNum;
+                int lastBlk = -1;
+                for (int j = ptrs - 1; j >= 0; j--)
+                    if (e[16+j]) { lastBlk = j; break; }
+                maxRecs = (lastBlk >= 0) ? (uint32_t)lastBlk * rpb + e[15] : 0;
+            }
+        }
+        uint32_t recs = (maxExt >= 0) ? (uint32_t)maxExt * rpe + maxRecs : 0;
+        cpu->memory[fcbAddr + 33] = (uint8_t)(recs & 0xFF);
+        cpu->memory[fcbAddr + 34] = (uint8_t)((recs >> 8) & 0xFF);
+        cpu->memory[fcbAddr + 35] = (uint8_t)((recs >> 16) & 0xFF);
+        if (maxExt < 0) cpu->H = 0x01; // file not found
+        cpu->A = (maxExt >= 0) ? 0x00 : 0xFF;
+        return;
+    }
+    std::string path = FCBDiskDir(cpu, cpm, fcbAddr) + "/" + FCBToHostName(cpu, fcbAddr);
     FILE *fp = fopen(path.c_str(), "rb");
     if (!fp)
     {
-        cpu->A = 0xFF;
+        cpu->H = 0x01; cpu->A = 0xFF; // file not found
         return;
     }
     fseek(fp, 0, SEEK_END);
@@ -802,7 +1858,7 @@ static bool HandleLineInput(intel8080 *cpu, CPMState &cpm)
     while (!cpm.terminal.inputQueue.empty())
     {
         uint8_t ch = cpm.terminal.inputQueue.front();
-        cpm.terminal.inputQueue.erase(cpm.terminal.inputQueue.begin());
+        cpm.terminal.inputQueue.pop_front();
 
         if (ch == 0x0D)
         {
@@ -843,6 +1899,84 @@ static void DoRet(intel8080 *cpu)
     cpu->PC = (hi << 8) | lo;
 }
 
+// ── BIOSCall — direct BIOS stub dispatch ─────────────────────────────────────
+
+bool BIOSCall(intel8080 *cpu, CPMState &cpm)
+{
+    int func = (cpu->PC - BIOS_ADDR) / 3;
+
+    // CONIN blocks until a character is available (same strategy as BDOS fn 1).
+    if (func == 2 && cpm.terminal.inputQueue.empty())
+        return cpm.running;
+
+    switch (func)
+    {
+    case 0: // WBOOT — treat like hitting 0x0000
+        if (cpm.ccpMode)
+        {
+            cpm.ccpRunning = true;
+            cpm.ccpPrompted = false;
+        }
+        else
+        {
+            cpm.running = false;
+        }
+        return cpm.running; // no DoRet — warm boot never returns
+
+    case 1: // CONST — console status
+        cpu->A = cpm.terminal.inputQueue.empty() ? 0x00 : 0xFF;
+        break;
+
+    case 2: // CONIN — console input (queue guaranteed non-empty here)
+        cpu->A = cpm.terminal.inputQueue.front();
+        cpm.terminal.inputQueue.pop_front();
+        break;
+
+    case 3: // CONOUT — output character in C
+        cpm.consoleOut((char)cpu->C);
+        break;
+
+    case 4: // LIST — printer output (stub)
+    case 5: // PUNCH — punch output (stub)
+        break;
+
+    case 6: // READER — return ^Z (EOF)
+        cpu->A = 0x1A;
+        break;
+
+    case 7:  // HOME   — no-op stub
+    case 9:  // SETTRK — no-op stub
+    case 10: // SETSEC — no-op stub
+    case 11: // SETDMA — no-op stub
+        break;
+
+    case 8: // SELDSK — return HL = DPH address (drive in C, 0=A)
+        cpu->H = (uint8_t)(DPH_ADDR >> 8);
+        cpu->L = (uint8_t)(DPH_ADDR & 0xFF);
+        break;
+
+    case 12: // READ  — stub, return A=0 (success)
+    case 13: // WRITE — stub, return A=0 (success)
+        cpu->A = 0x00;
+        break;
+
+    case 14: // LISTST — printer status (always ready)
+        cpu->A = 0xFF;
+        break;
+
+    case 15: // SECTRAN — no skew table, return HL=BC (logical == physical)
+        cpu->H = cpu->B;
+        cpu->L = cpu->C;
+        break;
+
+    default:
+        break;
+    }
+
+    DoRet(cpu);
+    return cpm.running;
+}
+
 // ── BDOSCall — dispatch ───────────────────────────────────────────────────────
 
 bool BDOSCall(intel8080 *cpu, CPMState &cpm)
@@ -865,6 +1999,7 @@ bool BDOSCall(intel8080 *cpu, CPMState &cpm)
     }
 
     // ── Normal dispatch ──────────────────────────────────────────────────
+    cpu->H = 0x00; // preset for 8-bit returns; 16-bit functions override
     switch (cpu->C)
     {
     case 0:
@@ -937,7 +2072,7 @@ bool BDOSCall(intel8080 *cpu, CPMState &cpm)
         BDOS_RenameFile(cpu, cpm);
         break;
     case 24:
-        BDOS_WriteProtectDisk(cpu, cpm);
+        BDOS_LoginVector(cpu, cpm);
         break;
     case 25:
         BDOS_GetCurrentDisk(cpu, cpm);
@@ -978,12 +2113,29 @@ bool BDOSCall(intel8080 *cpu, CPMState &cpm)
     case 37:
         BDOS_ResetDrive(cpu, cpm);
         break;
+    case 38:
+        BDOS_AccessDrive(cpu, cpm);
+        break;
+    case 39:
+        BDOS_FreeDrive(cpu, cpm);
+        break;
+    case 40:
+        BDOS_WriteRandomZeroFill(cpu, cpm);
+        break;
+    case 41:
+        BDOS_ParseFilename(cpu, cpm);
+        break;
     default:
         std::cerr << "[BDOS] fn " << (int)cpu->C
                   << " @ PC=0x" << std::hex << cpu->PC << std::dec << "\n";
         cpu->A = cpu->H = cpu->L = 0x00;
         break;
     }
+
+    // CP/M 2.2: B always mirrors H, L always mirrors A.
+    // 16-bit return functions set A=L before reaching here.
+    cpu->B = cpu->H;
+    cpu->L = cpu->A;
 
     DoRet(cpu);
     return cpm.running;
@@ -1016,7 +2168,7 @@ bool SaveCPMState(intel8080 *cpu, CPMState &cpm, const std::string &path)
         return false;
 
     fwrite("CPM8080\0", 1, 8, fp);
-    uint32_t version = 1;
+    uint32_t version = 3;
     fwrite(&version, 4, 1, fp);
 
     // CPU registers
@@ -1041,17 +2193,27 @@ bool SaveCPMState(intel8080 *cpu, CPMState &cpm, const std::string &path)
     fwrite(&cpm.dmaAddress, 2, 1, fp);
     fwrite(&cpm.currentDrive, 1, 1, fp);
     fwrite(&cpm.currentUser, 1, 1, fp);
-    uint8_t bools[6] = {cpm.running, cpm.ccpMode, cpm.ccpRunning,
-                        cpm.ccpPrompted, cpm.lineInputActive, 0};
-    fwrite(bools, 1, 6, fp);
+    uint8_t bools[5] = {cpm.running, cpm.ccpMode, cpm.ccpRunning,
+                        cpm.ccpPrompted, cpm.lineInputActive};
+    fwrite(bools, 1, 5, fp);
+    fwrite(&cpm.writeProtectedDrives, 2, 1, fp); // uint16_t, 16-drive bitmask
     fwrite(&cpm.lineInputFCB, 2, 1, fp);
-    int32_t si = cpm.searchIndex;
+    int32_t si = 0; // searchIndex removed; placeholder for file format compat
     fwrite(&si, 4, 1, fp);
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < MAX_DRIVES; i++)
         writeStr(fp, cpm.diskDirs[i]);
     writeStr(fp, cpm.ccpLine);
     writeStr(fp, cpm.lineInputAccum);
+
+    // Version 3: DSK image paths for all MAX_DRIVES drives.
+    for (int i = 0; i < MAX_DRIVES; i++) {
+        std::string p = (cpm.diskImages[i] && cpm.diskImages[i]->isOpen())
+                        ? cpm.diskImages[i]->path : "";
+        uint8_t ro = (cpm.diskImages[i] && cpm.diskImages[i]->readOnly) ? 1 : 0;
+        writeStr(fp, p);
+        fwrite(&ro, 1, 1, fp);
+    }
 
     fclose(fp);
     return true;
@@ -1072,7 +2234,7 @@ bool LoadCPMState(intel8080 *cpu, CPMState &cpm, const std::string &path)
     }
     uint32_t version;
     fread(&version, 4, 1, fp);
-    if (version != 1)
+    if (version != 1 && version != 2)
     {
         fclose(fp);
         return false;
@@ -1115,24 +2277,45 @@ bool LoadCPMState(intel8080 *cpu, CPMState &cpm, const std::string &path)
     fread(&cpm.dmaAddress, 2, 1, fp);
     fread(&cpm.currentDrive, 1, 1, fp);
     fread(&cpm.currentUser, 1, 1, fp);
-    uint8_t bools[6];
-    fread(bools, 1, 6, fp);
-    cpm.running = bools[0];
-    cpm.ccpMode = bools[1];
-    cpm.ccpRunning = bools[2];
-    cpm.ccpPrompted = bools[3];
-    cpm.lineInputActive = bools[4];
+    if (version >= 3) {
+        // Version 3: 5 bools + uint16_t writeProtectedDrives
+        uint8_t bools[5];
+        fread(bools, 1, 5, fp);
+        cpm.running = bools[0]; cpm.ccpMode = bools[1]; cpm.ccpRunning = bools[2];
+        cpm.ccpPrompted = bools[3]; cpm.lineInputActive = bools[4];
+        fread(&cpm.writeProtectedDrives, 2, 1, fp);
+    } else {
+        // Version 2 (4-drive): 6 bools, last one is writeProtectedDrives (uint8_t)
+        uint8_t bools[6];
+        fread(bools, 1, 6, fp);
+        cpm.running = bools[0]; cpm.ccpMode = bools[1]; cpm.ccpRunning = bools[2];
+        cpm.ccpPrompted = bools[3]; cpm.lineInputActive = bools[4];
+        cpm.writeProtectedDrives = bools[5];
+    }
+    cpm.submitQueue.clear();
     fread(&cpm.lineInputFCB, 2, 1, fp);
     int32_t si;
-    fread(&si, 4, 1, fp);
-    cpm.searchIndex = si;
-    cpm.searchResults.clear();
+    fread(&si, 4, 1, fp); // placeholder (searchIndex removed)
+    (void)si;
+    cpm.searchContexts.clear();
     cpm.fcbSlotMap.clear();
 
-    for (int i = 0; i < 4; i++)
+    int nDrives = (version >= 3) ? MAX_DRIVES : 4;
+    for (int i = 0; i < nDrives; i++)
         cpm.diskDirs[i] = readStr(fp);
     cpm.ccpLine = readStr(fp);
     cpm.lineInputAccum = readStr(fp);
+
+    // Version 2+: restore DSK image mounts.
+    if (version >= 2) {
+        DskUnmountAll(cpm);
+        for (int i = 0; i < nDrives; i++) {
+            std::string p = readStr(fp);
+            uint8_t ro = 0;
+            fread(&ro, 1, 1, fp);
+            if (!p.empty()) DskMount(cpm, i, p, ro != 0);
+        }
+    }
 
     fclose(fp);
     return true;
