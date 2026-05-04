@@ -32,7 +32,7 @@ void DrawScreen(intel8080 *cpu, unsigned int shaderProgram, unsigned int VAO, un
 void GraphicsCleanup(unsigned int VAO, unsigned int shaderProgram);
 
 // ── CP/M debug state ──────────────────────────────────────────────────────────
-#include "cpmdebugstate.h"
+#include "cpm_debug_state.h"
 
 // Render the 80×24 virtual terminal into an ImGui window and push keyboard
 // events captured this frame into cpm.terminal.inputQueue.
