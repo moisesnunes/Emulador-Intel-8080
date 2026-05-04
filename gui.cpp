@@ -15,11 +15,12 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
-#include "cpmdebugstate.h"
-#include "cpmdebugui.cpp"
+#include "cpm_debug_state.h"
 
 static MemoryEditor mem_edit;
 static CPMState *g_cpmState = nullptr;
+
+#include "cpm_debug_ui.cpp"
 
 // Callback para caracteres normais (espaço, letras, números, etc)
 static void glfw_char_callback(GLFWwindow *window, unsigned int codepoint)
@@ -74,29 +75,29 @@ static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int act
         g_cpmState->terminal.inputQueue.push_back(0x1B); // ESC
         break;
     // Setas como códigos WordStar
-    case GLFW_KEY_UP:                                    // Seta cima  → ^E
+    case GLFW_KEY_UP: // Seta cima  → ^E
         g_cpmState->terminal.inputQueue.push_back(0x05);
         break;
-    case GLFW_KEY_DOWN:                                  // Seta baixo → ^X
+    case GLFW_KEY_DOWN: // Seta baixo → ^X
         g_cpmState->terminal.inputQueue.push_back(0x18);
         break;
-    case GLFW_KEY_LEFT:                                  // Seta esq   → ^S
+    case GLFW_KEY_LEFT: // Seta esq   → ^S
         g_cpmState->terminal.inputQueue.push_back(0x13);
         break;
-    case GLFW_KEY_RIGHT:                                 // Seta dir   → ^D
+    case GLFW_KEY_RIGHT: // Seta dir   → ^D
         g_cpmState->terminal.inputQueue.push_back(0x04);
         break;
-    case GLFW_KEY_PAGE_UP:                               // PgUp → ^R (página anterior)
+    case GLFW_KEY_PAGE_UP: // PgUp → ^R (página anterior)
         g_cpmState->terminal.inputQueue.push_back(0x12);
         break;
-    case GLFW_KEY_PAGE_DOWN:                             // PgDn → ^C (página seguinte)
+    case GLFW_KEY_PAGE_DOWN: // PgDn → ^C (página seguinte)
         g_cpmState->terminal.inputQueue.push_back(0x03);
         break;
-    case GLFW_KEY_HOME:                                  // Home → ^QS (início da linha)
+    case GLFW_KEY_HOME: // Home → ^QS (início da linha)
         g_cpmState->terminal.inputQueue.push_back(0x11);
         g_cpmState->terminal.inputQueue.push_back(0x13);
         break;
-    case GLFW_KEY_END:                                   // End  → ^QD (fim da linha)
+    case GLFW_KEY_END: // End  → ^QD (fim da linha)
         g_cpmState->terminal.inputQueue.push_back(0x11);
         g_cpmState->terminal.inputQueue.push_back(0x04);
         break;
@@ -120,7 +121,7 @@ GLFWwindow *InitGUI(const std::string &title)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow *window = glfwCreateWindow(800, 600, title.c_str(), NULL, NULL);
+    GLFWwindow *window = glfwCreateWindow(1000, 800, title.c_str(), NULL, NULL);
     if (window == NULL)
     {
         std::cout << "Failed to create GLFW window" << std::endl;
@@ -143,6 +144,9 @@ GLFWwindow *InitGUI(const std::string &title)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
+    ImFontConfig fontCfg;
+    fontCfg.SizePixels = 13.0f;
+    io.Fonts->AddFontDefault(&fontCfg);
     // Setup Platform/Renderer bindings
     ImGui_ImplGlfw_InitForOpenGL(window, false);
     ImGui_ImplOpenGL3_Init("#version 130");
@@ -286,96 +290,126 @@ unsigned int InitializeVAO()
 
 void RenderDebugData(long long &oneInstructionCycle, bool &notHalted, bool &runOnce, bool &runFrame, intel8080 *cpu, char *PauseOnLine, bool &breakpointActive, int MAXINSTRUCTIONS, int *previousInstructions)
 {
-
-    int programCount = cpu->PC;
     int opcode = cpu->memory[cpu->PC];
     int firstByte = cpu->memory[cpu->PC + 1];
     int secondByte = cpu->memory[cpu->PC + 2];
-    // render your GUI
+
     ImGui::Begin("Register Info");
 
-    ImGui::Text("Current Instruction: %02X", opcode);
-    ImGui::Text("Next Byte: %02X %02X", firstByte, secondByte);
+    // PC / SP em amarelo/dourado
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+                       "PC: %04X    SP: %04X", cpu->PC, cpu->SP);
+    ImGui::Separator();
 
-    ImGui::Text("Instruction: %s", DISSAMBLER_STATES[opcode]);
+    // Instrução atual destacada em amarelo
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f),
+                       ">> %04X: %02X %02X %02X   %s",
+                       cpu->PC, opcode, firstByte, secondByte, DISSAMBLER_STATES[opcode]);
 
+    ImGui::Separator();
+
+    // Registradores
     ImGui::Text("Reg A: %02X", cpu->A);
     ImGui::Text("Reg B: %02X", cpu->B);
     ImGui::Text("Reg C: %02X", cpu->C);
     ImGui::Text("Reg D, E: %02X %02X", cpu->D, cpu->E);
     ImGui::Text("Reg H, L: %02X %02X", cpu->H, cpu->L);
-    ImGui::Text("Reg SP: %04X", cpu->SP);
-    ImGui::Text("Reg PC: %04X", cpu->PC);
-    ImGui::Text("Reg Status: %XS %XZ %XAC %XP %XCS", cpu->sf, cpu->zf, cpu->acf, cpu->pf, cpu->cf);
+
+    ImGui::Separator();
+
+    // Flags coloridas: verde=set, cinza=clear
+    auto flagColor = [](bool on) -> ImVec4
+    {
+        return on ? ImVec4(0.20f, 1.00f, 0.20f, 1.0f)
+                  : ImVec4(0.45f, 0.45f, 0.45f, 1.0f);
+    };
+    ImGui::Text("Flags:");
+    ImGui::SameLine();
+    ImGui::TextColored(flagColor(cpu->sf), "[S]");
+    ImGui::SameLine();
+    ImGui::TextColored(flagColor(cpu->zf), "[Z]");
+    ImGui::SameLine();
+    ImGui::TextColored(flagColor(cpu->acf), "[AC]");
+    ImGui::SameLine();
+    ImGui::TextColored(flagColor(cpu->pf), "[P]");
+    ImGui::SameLine();
+    ImGui::TextColored(flagColor(cpu->cf), "[C]");
+    ImGui::NewLine();
+
+    ImGui::Separator();
+
+    // Interrupções: verde=habilitado, vermelho=desabilitado
+    ImGui::Text("Interrupts:");
+    ImGui::SameLine();
+    ImGui::TextColored(
+        cpu->interrupts ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
+                        : ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+        "%s", cpu->interrupts ? "ENABLED" : "DISABLED");
+
+    ImGui::Separator();
 
     ImGui::Text("CycleTime: %lld mS", (oneInstructionCycle / 10000));
 
-    ImGui::Text("Pause on Line: ");
+    ImGui::Text("Pause on Line:");
     ImGui::SameLine();
-    ImGui::InputText("0x0000", PauseOnLine, 5);
+    ImGui::SetNextItemWidth(80);
+    ImGui::InputText("##pauseline", PauseOnLine, 5, ImGuiInputTextFlags_CharsHexadecimal);
 
-    if (ImGui::Button("Breakpoint"))
+    if (ImGui::Button("Breakpoint", ImVec2(90, 0)))
     {
         std::cout << "Breakpoint" << std::endl;
         breakpointActive ^= 1;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset"))
+    if (breakpointActive)
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.1f, 1.0f), "@ 0x%s", PauseOnLine);
+    }
+
+    if (ImGui::Button("Reset", ImVec2(65, 0)))
     {
         cpu->PC = 0;
         for (int address = 0x2000; address <= 0xFFFF; address++)
-        {
             cpu->memory[address] = 0;
-        }
-
         for (int address = 0; address <= MAXINSTRUCTIONS; address++)
-        {
             previousInstructions[address] = 0;
-        }
     }
 
-    if (ImGui::Button("Start/Pause"))
-    {
-        // std::cout << "Breakpoint" << std::endl;
+    if (ImGui::Button(notHalted ? "  Pause  " : "   Run   ", ImVec2(90, 0)))
         notHalted ^= 1;
-    }
 
-    if (ImGui::Button("ISR Enable"))
+    ImGui::SameLine();
+    if (ImGui::Button("Step", ImVec2(65, 0)))
     {
-        // std::cout << "Breakpoint" << std::endl;
-        cpu->interrupts ^= 1;
-    }
-
-    if (ImGui::Button("Next Code"))
-    {
-        // std::cout << "Breakpoint" << std::endl;
         notHalted = true;
         runOnce = true;
     }
 
-    if (ImGui::Button("Cycle Time Up"))
+    ImGui::SameLine();
+    if (ImGui::Button("ISR", ImVec2(50, 0)))
+        cpu->interrupts ^= 1;
+
+    if (ImGui::Button("Cycle Up"))
     {
-        // std::cout << "Breakpoint" << std::endl;
         oneInstructionCycle *= (unsigned long long)2;
         if (oneInstructionCycle == 0)
-        {
             oneInstructionCycle = 10000000;
-        }
     }
-
-    if (ImGui::Button("Cycle Time Down"))
-    {
-        // std::cout << "Breakpoint" << std::endl;
+    ImGui::SameLine();
+    if (ImGui::Button("Cycle Down"))
         oneInstructionCycle /= (unsigned long long)2;
-    }
 
-    if (ImGui::Button("Frame/Instruction"))
-    {
-        // std::cout << "Breakpoint" << std::endl;
+    ImGui::SameLine();
+    if (ImGui::Button("Frame/Instr"))
         runFrame ^= 1;
-    }
 
-    // ImGui::ShowDemoWindow();
+    ImGui::Separator();
+
+    // Barra de status: verde=running, laranja=paused
+    ImGui::TextColored(
+        notHalted ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
+                  : ImVec4(1.0f, 0.6f, 0.1f, 1.0f),
+        "%-8s", notHalted ? "RUNNING" : "PAUSED");
 
     mem_edit.DrawWindow("Memory Edit", cpu->memory, 0xFFFF);
 
@@ -450,11 +484,23 @@ void ImGUIFrame(long long &oneInstructionCycle, bool &notHalted, bool &runOnce, 
     {
         int index = currentInstruction - k - 1;
         if (index < 0)
-        {
             index = MAXINSTRUCTIONS + index;
-        }
-        // programCount = cpu->PC;
-        ImGui::Text("%04X %02X %02X %02X     %s", previousInstructions[(index * 4)], previousInstructions[(index * 4) + 1], previousInstructions[(index * 4) + 2], previousInstructions[(index * 4) + 3], DISSAMBLER_STATES[previousInstructions[(index * 4) + 1]]);
+
+        if (k == 0)
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                               "> %04X %02X %02X %02X  %s",
+                               previousInstructions[(index * 4)],
+                               previousInstructions[(index * 4) + 1],
+                               previousInstructions[(index * 4) + 2],
+                               previousInstructions[(index * 4) + 3],
+                               DISSAMBLER_STATES[previousInstructions[(index * 4) + 1]]);
+        else
+            ImGui::Text("  %04X %02X %02X %02X  %s",
+                        previousInstructions[(index * 4)],
+                        previousInstructions[(index * 4) + 1],
+                        previousInstructions[(index * 4) + 2],
+                        previousInstructions[(index * 4) + 3],
+                        DISSAMBLER_STATES[previousInstructions[(index * 4) + 1]]);
     }
 
     ImGui::End();
@@ -478,30 +524,30 @@ void ImGUIFrame(long long &oneInstructionCycle, bool &notHalted, bool &runOnce, 
 
 void DrawTerminal(CPMState &cpm)
 {
-    // Fixed-size window that fits the 80×24 grid exactly. NoResize keeps the
-    // layout stable; NoScrollbar avoids eating into the character area.
+    // Estilo preto e branco — fundo preto com texto branco
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.00f, 0.00f, 0.00f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.20f, 0.20f, 0.20f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.10f, 0.10f, 0.10f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.50f, 0.50f, 0.50f, 1.00f));
+
     ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
-    ImGui::Begin("CP/M Terminal", nullptr,
+    ImGui::Begin("CP/M 2.2  [Intel 8080]", nullptr,
                  ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoScrollbar);
 
-    // Record where the text content begins so we can overlay the cursor rect.
     ImVec2 origin = ImGui::GetCursorScreenPos();
 
-    // Render each row as a fixed-width string. TextUnformatted with an explicit
-    // end pointer prints exactly COLS characters without needing a null terminator
-    // and without interpreting format specifiers.
     for (int row = 0; row < TerminalState::ROWS; row++)
     {
         const char *start = cpm.terminal.buffer[row];
         ImGui::TextUnformatted(start, start + TerminalState::COLS);
     }
 
-    // Draw a blinking block cursor over the current cursor position.
-    // fmod gives a 0-1 sawtooth at 2 Hz; visible for 70 % of each cycle.
+    // Cursor piscante (bloco branco)
     float blink = fmodf((float)ImGui::GetTime() * 2.0f, 1.0f);
-    if (blink < 0.7f)
+    if (blink < 0.70f)
     {
         ImVec2 charSize = ImGui::CalcTextSize("A");
         float lineH = ImGui::GetTextLineHeightWithSpacing();
@@ -510,10 +556,22 @@ void DrawTerminal(CPMState &cpm)
         ImGui::GetWindowDrawList()->AddRectFilled(
             ImVec2(cx, cy),
             ImVec2(cx + charSize.x, cy + charSize.y),
-            IM_COL32(200, 200, 200, 180));
+            IM_COL32(220, 220, 220, 210));
     }
 
+    // Status bar
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.0f),
+                       " %c:  User:%d  |  Queue:%zu  |  CCP:%s  |  Cursor:(%d,%d) ",
+                       'A' + cpm.currentDrive,
+                       cpm.currentUser,
+                       cpm.terminal.inputQueue.size(),
+                       cpm.ccpRunning ? "ON" : "OFF",
+                       cpm.terminal.cursorX,
+                       cpm.terminal.cursorY);
+
     ImGui::End();
+    ImGui::PopStyleColor(5);
 }
 
 void ImGUIFrameCPM(CPMState &cpm, intel8080 *cpu, CPMDebugState &dbg)
