@@ -1,0 +1,42 @@
+; Símbolos padrão CP/M 2.2
+; Formato: ADDR  NOME  (endereço em hex, sem 0x)
+
+; ─── Vetores de sistema ───────────────────────────────────────────────────────
+0000 WBOOT          ; warm boot / system reset
+0005 BDOS           ; entrada do BDOS (call 5)
+0038 RST7           ; vetor RST 7
+
+; ─── Área do sistema ─────────────────────────────────────────────────────────
+0000 ZP_BASE        ; zero page (page 0)
+0006 IOBYTE         ; I/O byte
+0004 CDISK          ; drive atual + user
+0080 DEFAULT_DMA    ; DMA padrão (buffer de 128 bytes)
+0100 TPA            ; Transient Program Area — início dos .COM
+
+; ─── BDOS (ajuste se o seu BDOS estiver em outro endereço) ───────────────────
+F800 BDOS_ENTRY     ; entrada real do BDOS
+F803 BDOS_DISPATCH
+
+; ─── CCP (ajuste conforme seu layout) ────────────────────────────────────────
+E800 CCP_ENTRY
+E803 CCP_START
+
+; ─── BIOS (ajuste conforme seu layout) ───────────────────────────────────────
+FE00 BIOS_BASE
+FE00 BIOS_BOOT
+FE03 BIOS_WBOOT
+FE06 BIOS_CONST
+FE09 BIOS_CONIN
+FE0C BIOS_CONOUT
+FE0F BIOS_LIST
+FE12 BIOS_PUNCH
+FE15 BIOS_READER
+FE18 BIOS_HOME
+FE1B BIOS_SELDSK
+FE1E BIOS_SETTRK
+FE21 BIOS_SETSEC
+FE24 BIOS_SETDMA
+FE27 BIOS_READ
+FE2A BIOS_WRITE
+FE2D BIOS_LISTST
+FE30 BIOS_SECTRAN
