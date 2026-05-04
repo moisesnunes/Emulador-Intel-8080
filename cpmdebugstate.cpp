@@ -2,10 +2,11 @@
 // CPMDebugState.cpp - Implementação de métodos de debug
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#include "cpmdebugstate.h"
+#include "cpm_debug_state.h"
 #include "intel8080.h"
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Log de Instruções
@@ -170,14 +171,64 @@ std::string CPMDebugState::getInstructionDisplay(int index)
 
     char buffer[256];
     snprintf(buffer, sizeof(buffer),
-             "%04X: %02X %02X %02X | A:%02X B:%02X C:%02X D:%02X | SP:%04X %s%s%s%s",
+             "%04X: %02X %02X %02X  %-12s  A:%02X BC:%02X%02X DE:%02X%02X HL:%02X%02X SP:%04X  %s%s%s%s",
              log.pc, log.opcode, log.param1, log.param2,
-             log.A, log.B, log.C, log.D,
+             DISSAMBLER_STATES[log.opcode],
+             log.A, log.B, log.C, log.D, log.E, log.H, log.L,
              log.SP,
-             log.carry ? "C" : "-",
-             log.zero ? "Z" : "-",
-             log.sign ? "S" : "-",
+             log.carry  ? "C" : "-",
+             log.zero   ? "Z" : "-",
+             log.sign   ? "S" : "-",
              log.parity ? "P" : "-");
 
     return std::string(buffer);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tabela de Símbolos
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Formato suportado (um símbolo por linha):
+//   ADDR  NAME        (ex:  F800 BDOS)
+//   ; comentário ou # comentário são ignorados
+// Endereço em hex (com ou sem prefixo 0x), nome sem espaços.
+void CPMDebugState::loadSymbols(const char *path)
+{
+    symbols.clear();
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+    {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ';' || *p == '#' || *p == '\0' || *p == '\n' || *p == '\r')
+            continue;
+
+        char *endAddr;
+        uint16_t addr = (uint16_t)strtoul(p, &endAddr, 16);
+        if (endAddr == p) continue;
+
+        while (*endAddr == ' ' || *endAddr == '\t') endAddr++;
+        if (*endAddr == '\0' || *endAddr == '\n' || *endAddr == '\r') continue;
+
+        char name[64];
+        strncpy(name, endAddr, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        int len = (int)strlen(name);
+        while (len > 0 && (name[len-1] == '\n' || name[len-1] == '\r' ||
+                           name[len-1] == ' '  || name[len-1] == '\t'))
+            name[--len] = '\0';
+
+        if (len > 0)
+            symbols[addr] = name;
+    }
+    fclose(fp);
+}
+
+const char *CPMDebugState::resolveSymbol(uint16_t addr) const
+{
+    auto it = symbols.find(addr);
+    return it != symbols.end() ? it->second.c_str() : nullptr;
 }
