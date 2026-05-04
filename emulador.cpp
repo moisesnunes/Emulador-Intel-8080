@@ -101,6 +101,12 @@ int main(int argc, char *argv[])
         CPMState cpm;
         std::string diskDir = exeDir + "/roms/" + config.name;
 
+        // Propagate peripheral device paths and terminal type from game.cfg.
+        cpm.readerPath          = config.cpmReader;
+        cpm.punchPath           = config.cpmPunch;
+        cpm.printerPath         = config.cpmPrinter;
+        cpm.terminal.termType   = config.cpmTerminal;
+
         RegisterCPMTerminalCallbacks(window, &cpm);
 
         if (config.romFiles.empty())
@@ -151,6 +157,12 @@ int main(int argc, char *argv[])
                     BDOSCall(cpu, cpm);
                     // In CCP mode, fn 0 (System Reset) sets ccpRunning instead of
                     // clearing running — handled inside BDOS_SystemReset.
+                }
+                else if (cpu->PC >= BIOS_ADDR &&
+                         cpu->PC < (uint16_t)(BIOS_ADDR + 16 * 3) &&
+                         (cpu->PC - BIOS_ADDR) % 3 == 0)
+                {
+                    BIOSCall(cpu, cpm);
                 }
                 else
                 {
