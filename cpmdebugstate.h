@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Histórico de Instruções Executadas
@@ -65,6 +66,17 @@ struct CPMDebugState
     uint16_t lastBdosAddr = 0;   // Endereço onde BDOS foi chamado
     bool inBdos = false;         // Atualmente dentro de BDOS?
 
+    // ─── BDOS History ────────────────────────────────────────────────────────
+    struct BdosLogEntry {
+        uint8_t fn    = 0xFF;
+        bool    valid = false;
+    };
+    static constexpr int BDOS_LOG_MAX = 32;
+    BdosLogEntry bdosLog[BDOS_LOG_MAX] = {};
+    int          bdosLogHead  = 0;
+    int          bdosLogCount = 0;
+    void logBdosCall(uint8_t fn);
+
     // ─── Terminal State ─────────────────────────────────────────────────────
     std::string lastCommand = ""; // Último comando CCP digitado
     std::string lastOutput = "";  // Última linha do terminal
@@ -85,6 +97,10 @@ struct CPMDebugState
     // ─── Speed throttle ─────────────────────────────────────────────────────
     double targetMHz = 0.0; // 0 = unlimited; otherwise throttle CPU to this speed
 
+    // ─── Tabela de Símbolos ──────────────────────────────────────────────────
+    std::unordered_map<uint16_t, std::string> symbols;
+    char symbolFilePath[512] = "symbols.sym";
+
     // ═══════════════════════════════════════════════════════════════════════
     // Métodos
     // ═══════════════════════════════════════════════════════════════════════
@@ -97,6 +113,9 @@ struct CPMDebugState
     std::string getMemoryDisplay(class intel8080 *cpu, uint16_t addr, int lines);
     std::string getBdosDisplay();
     std::string getStackDisplay(class intel8080 *cpu);
+
+    void        loadSymbols(const char *path);
+    const char *resolveSymbol(uint16_t addr) const;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +177,17 @@ inline void CPMDebugState::updateBdosInfo(uint8_t function)
 {
     lastBdosCall = function;
     inBdos = true;
+    logBdosCall(function);
+}
+
+inline void CPMDebugState::logBdosCall(uint8_t fn)
+{
+    int idx = bdosLogHead % BDOS_LOG_MAX;
+    bdosLog[idx].fn    = fn;
+    bdosLog[idx].valid = true;
+    bdosLogHead++;
+    if (bdosLogCount < BDOS_LOG_MAX)
+        bdosLogCount++;
 }
 
 inline void CPMDebugState::updateCcpInfo(const std::string &command, const std::string &output)
