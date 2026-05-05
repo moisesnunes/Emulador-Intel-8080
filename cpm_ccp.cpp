@@ -33,6 +33,46 @@ static std::string CCPUpper(std::string s)
     return s;
 }
 
+// Expand $VAR and %VAR% in an already-uppercased line.
+// USER is computed dynamically from cpm.currentUser; other vars come from ccpEnv.
+static std::string CCPExpandVars(const CPMState &cpm, const std::string &line)
+{
+    auto lookup = [&](const std::string &name) -> std::string {
+        if (name == "USER") {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%d", cpm.currentUser);
+            return buf;
+        }
+        auto it = cpm.ccpEnv.find(name);
+        return (it != cpm.ccpEnv.end()) ? it->second : "";
+    };
+
+    std::string result;
+    result.reserve(line.size());
+    for (size_t i = 0; i < line.size(); ) {
+        if (line[i] == '$' && i + 1 < line.size() &&
+            (isalpha((unsigned char)line[i+1]) || line[i+1] == '_')) {
+            size_t end = i + 1;
+            while (end < line.size() &&
+                   (isalnum((unsigned char)line[end]) || line[end] == '_'))
+                ++end;
+            result += lookup(line.substr(i + 1, end - i - 1));
+            i = end;
+        } else if (line[i] == '%') {
+            size_t close = line.find('%', i + 1);
+            if (close != std::string::npos && close > i + 1) {
+                result += lookup(line.substr(i + 1, close - i - 1));
+                i = close + 1;
+            } else {
+                result += line[i++];
+            }
+        } else {
+            result += line[i++];
+        }
+    }
+    return result;
+}
+
 // Simple wildcard match: '?' = any char, '*' = any sequence.
 static bool CCPMatch(const std::string &name, const std::string &pat)
 {
@@ -84,10 +124,26 @@ static void CCPSetupFCB(intel8080 *cpu, uint16_t fcbAddr, const std::string &tok
     auto dot = rest.find('.');
     std::string nm = (dot != std::string::npos) ? rest.substr(0, dot) : rest;
     std::string ex = (dot != std::string::npos) ? rest.substr(dot + 1) : "";
-    for (size_t k = 0; k < std::min(nm.size(), (size_t)8); k++)
-        cpu->memory[fcbAddr + 1 + k] = (uint8_t)nm[k];
-    for (size_t k = 0; k < std::min(ex.size(), (size_t)3); k++)
-        cpu->memory[fcbAddr + 9 + k] = (uint8_t)ex[k];
+
+    // Expand '*' → fill remaining chars with '?' (per CP/M CCP CONVERT routine).
+    bool starName = false;
+    for (size_t k = 0; k < 8; k++) {
+        if (starName || (k < nm.size() && nm[k] == '*')) {
+            starName = true;
+            cpu->memory[fcbAddr + 1 + k] = '?';
+        } else if (k < nm.size()) {
+            cpu->memory[fcbAddr + 1 + k] = (uint8_t)nm[k];
+        }
+    }
+    bool starExt = false;
+    for (size_t k = 0; k < 3; k++) {
+        if (starExt || (k < ex.size() && ex[k] == '*')) {
+            starExt = true;
+            cpu->memory[fcbAddr + 9 + k] = '?';
+        } else if (k < ex.size()) {
+            cpu->memory[fcbAddr + 9 + k] = (uint8_t)ex[k];
+        }
+    }
 }
 
 // ── Drive resolution helper ───────────────────────────────────────────────────
@@ -122,7 +178,7 @@ static void CCPBuiltinDir(CPMState &cpm, const std::string &args)
     }
 
     char driveLetter = (char)('A' + cpm.currentDrive);
-    char header[8];
+    char header[6];
     snprintf(header, sizeof(header), "%c: ", driveLetter);
     CCPPrint(cpm, "\n");
     CCPPrint(cpm, header);
@@ -137,18 +193,26 @@ static void CCPBuiltinDir(CPMState &cpm, const std::string &args)
         if (!CCPMatch(uname, pat))
             continue;
 
-        auto dot = uname.rfind('.');
-        std::string nm = (dot != std::string::npos) ? uname.substr(0, dot) : uname;
-        std::string ex = (dot != std::string::npos) ? uname.substr(dot + 1) : "   ";
-        while (nm.size() < 8)
-            nm += ' ';
-        while (ex.size() < 3)
-            ex += ' ';
+        auto dotpos = uname.rfind('.');
+        std::string nm = (dotpos != std::string::npos) ? uname.substr(0, dotpos) : uname;
+        std::string ex = (dotpos != std::string::npos) ? uname.substr(dotpos + 1) : "   ";
+        while (nm.size() < 8) nm += ' ';
+        while (ex.size() < 3) ex += ' ';
 
-        char entry[16];
-        snprintf(entry, sizeof(entry), "%.8s.%.3s  ", nm.c_str(), ex.c_str());
-        if (count > 0 && count % 4 == 0)
-            CCPPrint(cpm, "\n   ");
+        if (count > 0)
+        {
+            if (count % 4 == 0)
+            { // new line — reprint drive header (matches real CP/M DIR)
+                CCPPrint(cpm, "\n");
+                CCPPrint(cpm, header);
+            }
+            else
+            {
+                CCPPrint(cpm, " : ");
+            }
+        }
+        char entry[13];
+        snprintf(entry, sizeof(entry), "%.8s %.3s", nm.c_str(), ex.c_str());
         CCPPrint(cpm, entry);
         count++;
     }
@@ -159,7 +223,7 @@ static void CCPBuiltinDir(CPMState &cpm, const std::string &args)
     CCPPrint(cpm, "\n");
 }
 
-static void CCPBuiltinEra(CPMState &cpm, const std::string &args)
+static void CCPBuiltinEra(CPMState &cpm, const std::string &args, bool confirmed = false)
 {
     if (args.empty())
     {
@@ -168,11 +232,23 @@ static void CCPBuiltinEra(CPMState &cpm, const std::string &args)
     }
     std::string pat = CCPUpper(args);
     const std::string &dirPath = CCPResolveDir(cpm, pat);
+    if (pat.empty())
+        pat = "*.*";
+
+    // Require explicit confirmation before erasing all files (matches CP/M CCP ERASE).
+    if (!confirmed && (pat == "*.*" || pat == "*"))
+    {
+        cpm.ccpEraConfirm    = true;
+        cpm.ccpEraPendingArgs = args; // preserve drive prefix if present
+        cpm.ccpPrompted      = false;
+        return;
+    }
 
     DIR *dir = opendir(dirPath.c_str());
     if (!dir)
         return;
     struct dirent *ent;
+    bool found = false;
     while ((ent = readdir(dir)) != nullptr)
     {
         if (ent->d_name[0] == '.')
@@ -182,9 +258,12 @@ static void CCPBuiltinEra(CPMState &cpm, const std::string &args)
         {
             std::string path = dirPath + "/" + ent->d_name;
             remove(path.c_str());
+            found = true;
         }
     }
     closedir(dir);
+    if (!found)
+        CCPPrint(cpm, "\nNo file\n");
 }
 
 static void CCPBuiltinRen(CPMState &cpm, const std::string &args)
@@ -339,6 +418,53 @@ static void CCPBuiltinUser(CPMState &cpm, const std::string &args)
         CCPPrint(cpm, "User 0-15\n");
 }
 
+static void CCPBuiltinSet(CPMState &cpm, const std::string &args)
+{
+    auto printVar = [&](const std::string &name, const std::string &val) {
+        CCPPrint(cpm, name.c_str());
+        CCPPrint(cpm, "=");
+        CCPPrint(cpm, val.c_str());
+        CCPPrint(cpm, "\n");
+    };
+
+    if (args.empty()) {
+        char ubuf[4];
+        snprintf(ubuf, sizeof(ubuf), "%d", cpm.currentUser);
+        printVar("USER", ubuf);
+        for (auto &kv : cpm.ccpEnv)
+            printVar(kv.first, kv.second);
+        return;
+    }
+
+    size_t eq = args.find('=');
+    if (eq == std::string::npos) {
+        std::string name = args;
+        while (!name.empty() && name.back() == ' ') name.pop_back();
+        if (name == "USER") {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "USER=%d\n", cpm.currentUser);
+            CCPPrint(cpm, buf);
+        } else {
+            auto it = cpm.ccpEnv.find(name);
+            if (it != cpm.ccpEnv.end())
+                printVar(name, it->second);
+            else { CCPPrint(cpm, name.c_str()); CCPPrint(cpm, ": undefined\n"); }
+        }
+        return;
+    }
+
+    std::string name = args.substr(0, eq);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    std::string val  = args.substr(eq + 1);
+
+    if (name == "USER") { CCPPrint(cpm, "USER: read-only, use USER command\n"); return; }
+
+    if (val.empty())
+        cpm.ccpEnv.erase(name);
+    else
+        cpm.ccpEnv[name] = val;
+}
+
 static void CCPBuiltinMount(CPMState &cpm, const std::string &args)
 {
     std::string a = args;
@@ -477,6 +603,8 @@ static void CCPBuiltinHelp(CPMState &cpm)
     CCPPrint(cpm, "  ED     <file>            line editor (A/D/I/L/E/Q)\n");
     CCPPrint(cpm, "  SUBMIT <file>            run batch .SUB file\n");
     CCPPrint(cpm, "  USER   [n]               set/show user area (0-15)\n");
+    CCPPrint(cpm, "  SET    [var[=val]]        set/show env vars ($VAR or %%VAR%%)\n");
+    CCPPrint(cpm, "    PATH=A: B:             search A: then B: for .COM files\n");
     CCPPrint(cpm, "  VER                      show emulator version\n");
     CCPPrint(cpm, "  CLS                      clear screen\n");
     CCPPrint(cpm, "  READER [path]            set/show reader device (fn 03h)\n");
@@ -786,6 +914,8 @@ bool CCPLoadCom(intel8080 *cpu, CPMState &cpm,
                 const std::string &name, const std::string &args)
 {
     std::string uname = CCPUpper(name);
+    bool hasDrivePrefix = (uname.size() >= 2 && uname[1] == ':' &&
+                           isalpha((unsigned char)uname[0]));
     const std::string &comDir = CCPResolveDir(cpm, uname);
 
     // Try NAME.COM, then NAME as-is (might already carry extension).
@@ -796,6 +926,39 @@ bool CCPLoadCom(intel8080 *cpu, CPMState &cpm,
         path = comDir + "/" + uname;
         fp = fopen(path.c_str(), "rb");
     }
+
+    // If not found and no explicit drive given, search PATH drives.
+    if (!fp && !hasDrivePrefix)
+    {
+        auto it = cpm.ccpEnv.find("PATH");
+        if (it != cpm.ccpEnv.end())
+        {
+            const std::string &pathVal = it->second;
+            for (size_t i = 0; i < pathVal.size() && !fp; )
+            {
+                while (i < pathVal.size() &&
+                       (pathVal[i] == ' ' || pathVal[i] == ';')) ++i;
+                if (i + 1 < pathVal.size() &&
+                    isalpha((unsigned char)pathVal[i]) && pathVal[i+1] == ':')
+                {
+                    int d = toupper((unsigned char)pathVal[i]) - 'A';
+                    i += 2;
+                    if (d >= 0 && d < MAX_DRIVES && !cpm.diskDirs[d].empty())
+                    {
+                        path = cpm.diskDirs[d] + "/" + uname + ".COM";
+                        fp = fopen(path.c_str(), "rb");
+                        if (!fp)
+                        {
+                            path = cpm.diskDirs[d] + "/" + uname;
+                            fp = fopen(path.c_str(), "rb");
+                        }
+                    }
+                }
+                else ++i;
+            }
+        }
+    }
+
     if (!fp)
     {
         CCPPrint(cpm, name.c_str());
@@ -807,15 +970,19 @@ bool CCPLoadCom(intel8080 *cpu, CPMState &cpm,
     long size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
-    if (size > (long)(BDOS_ADDR - 0x0100))
+    // Resident code must fit below the overlay region (or below BDOS if none defined).
+    uint16_t residentTop = cpm.overlayBase ? cpm.overlayBase : BDOS_ADDR;
+    if (size > (long)(residentTop - 0x0100))
     {
         fclose(fp);
         CCPPrint(cpm, "Program too large\n");
         return false;
     }
 
-    // Clear TPA, load .COM at 0x0100.
-    memset(&cpu->memory[0x0100], 0, BDOS_ADDR - 0x0100);
+    // Clear only the resident code area [0x0100..residentTop).
+    // The overlay region [overlayBase..overlayTop) is preserved so a warm
+    // re-run does not force the overlay loader to re-fetch cached overlays.
+    memset(&cpu->memory[0x0100], 0, residentTop - 0x0100);
     fread(&cpu->memory[0x0100], 1, (size_t)size, fp);
     fclose(fp);
 
@@ -1021,6 +1188,11 @@ static bool CCPDispatch(intel8080 *cpu, CPMState &cpm,
         CCPBuiltinUser(cpm, args);
         return false;
     }
+    if (cmd == "SET")
+    {
+        CCPBuiltinSet(cpm, args);
+        return false;
+    }
     if (cmd == "STAT")
     {
         CCPBuiltinStat(cpm, args);
@@ -1141,7 +1313,7 @@ static bool CCPDispatch(intel8080 *cpu, CPMState &cpm,
 static bool CCPParseAndDispatch(intel8080 *cpu, CPMState &cpm,
                                 const std::string &uline)
 {
-    auto segs = CCPParseSegments(uline);
+    auto segs = CCPParseSegments(CCPExpandVars(cpm, uline));
     if (segs.empty() || segs[0].cmd.empty())
         return false;
 
@@ -1229,9 +1401,18 @@ void CCPInit(intel8080 *cpu, CPMState &cpm, const std::string &diskDir)
     CCPPrint(cpm, "\n");
 
     int tpaKb = (BDOS_ADDR - 0x0100) / 1024;
-    char buf[80];
+    char buf[128];
     snprintf(buf, sizeof(buf), "  TPA: %dK  (0x0100 - 0x%04X)\n", tpaKb, BDOS_ADDR - 1);
     CCPPrint(cpm, buf);
+    if (cpm.overlayBase) {
+        int resKb  = (cpm.overlayBase - 0x0100) / 1024;
+        uint16_t ovTop = cpm.overlayTop();
+        int ovKb   = (ovTop - cpm.overlayBase) / 1024;
+        snprintf(buf, sizeof(buf),
+                 "  Resident: %dK  (0x0100 - 0x%04X)    Overlay: %dK  (0x%04X - 0x%04X)\n",
+                 resKb, cpm.overlayBase - 1, ovKb, cpm.overlayBase, ovTop - 1);
+        CCPPrint(cpm, buf);
+    }
 
     CCPPrint(cpm, "  Drives:");
     for (int i = 0; i < MAX_DRIVES; i++)
@@ -1321,12 +1502,17 @@ bool CCPTick(intel8080 *cpu, CPMState &cpm)
         cpm.terminal.inputQueue.push_back(0x0D);
     }
 
-    // Display prompt once per command cycle.
+    // Display prompt once per command cycle (or ERA confirmation).
     if (!cpm.ccpPrompted)
     {
-        char prompt[6];
-        snprintf(prompt, sizeof(prompt), "\r%c>", 'A' + cpm.currentDrive);
-        CCPPrint(cpm, prompt);
+        if (cpm.ccpEraConfirm)
+            CCPPrint(cpm, "All (y/n)?");
+        else
+        {
+            char prompt[6];
+            snprintf(prompt, sizeof(prompt), "\r%c>", 'A' + cpm.currentDrive);
+            CCPPrint(cpm, prompt);
+        }
         cpm.ccpPrompted = true;
         cpm.ccpLine.clear();
     }
@@ -1344,6 +1530,16 @@ bool CCPTick(intel8080 *cpu, CPMState &cpm)
             std::string line = cpm.ccpLine;
             cpm.ccpLine.clear();
             cpm.ccpPrompted = false;
+
+            if (cpm.ccpEraConfirm)
+            {
+                cpm.ccpEraConfirm = false;
+                if (CCPUpper(line) == "Y")
+                    CCPBuiltinEra(cpm, cpm.ccpEraPendingArgs, /*confirmed=*/true);
+                cpm.ccpEraPendingArgs.clear();
+                return false;
+            }
+
             if (line.empty())
                 return false;
 
