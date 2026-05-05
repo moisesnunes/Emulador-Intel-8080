@@ -106,6 +106,12 @@ int main(int argc, char *argv[])
         cpm.punchPath           = config.cpmPunch;
         cpm.printerPath         = config.cpmPrinter;
         cpm.terminal.termType   = config.cpmTerminal;
+        cpm.overlayBase         = config.overlayBase;
+        cpm.overlaySize         = config.overlaySize;
+        cpm.serial.port         = config.serialPort;
+
+        // Expose serial state to MachineIn/MachineOut (8251 USART port simulation).
+        g_serialState = &cpm;
 
         RegisterCPMTerminalCallbacks(window, &cpm);
 
@@ -123,6 +129,13 @@ int main(int argc, char *argv[])
         }
 
         CPMDebugState dbg;
+
+        // Derive the NVRAM path from the disk directory.
+        std::string nvramFile = diskDir + "/emulator.nvram";
+        std::strncpy(dbg.nvramPath, nvramFile.c_str(), sizeof(dbg.nvramPath) - 1);
+
+        // Auto-load: silently restore if an NVRAM snapshot exists.
+        LoadCPMState(cpu, cpm, nvramFile);
 
         unsigned long long throttleEpoch = GetCurrentTime100ns();
         uint64_t throttleCycles = 0;
@@ -157,12 +170,14 @@ int main(int argc, char *argv[])
                     BDOSCall(cpu, cpm);
                     // In CCP mode, fn 0 (System Reset) sets ccpRunning instead of
                     // clearing running — handled inside BDOS_SystemReset.
+                    dbg.resetStuckCounter();
                 }
                 else if (cpu->PC >= BIOS_ADDR &&
                          cpu->PC < (uint16_t)(BIOS_ADDR + 16 * 3) &&
                          (cpu->PC - BIOS_ADDR) % 3 == 0)
                 {
                     BIOSCall(cpu, cpm);
+                    dbg.resetStuckCounter();
                 }
                 else
                 {
@@ -179,6 +194,9 @@ int main(int argc, char *argv[])
                         dbg.logInstruction(cpu);
                         ExecuteOpCode(op, cpu);
                         throttleCycles += OPCODE_CYCLES[op];
+                        dbg.tickStuck(cpu->PC, OPCODE_CYCLES[op]);
+                        if (dbg.stuckDetected)
+                            dbg.notHalted = false;
 
                         if (dbg.targetMHz > 0.0) {
                             unsigned long long now = GetCurrentTime100ns();
@@ -209,6 +227,7 @@ int main(int argc, char *argv[])
             currentTime = GetCurrentTime100ns();
             if ((currentTime - lastGuiUpdate) >= (unsigned long long)(10000000 / 60))
             {
+                SerialTick(cpm);
                 glfwPollEvents();
                 glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -217,6 +236,13 @@ int main(int argc, char *argv[])
                 lastGuiUpdate = currentTime;
             }
         }
+
+        SerialClose(cpm);
+        g_serialState = nullptr;
+
+        // Auto-save NVRAM on exit if enabled.
+        if (dbg.nvramAutoSave)
+            SaveCPMState(cpu, cpm, std::string(dbg.nvramPath));
 
         GraphicsCleanup(VAO, shaderProgram);
         return 0;
