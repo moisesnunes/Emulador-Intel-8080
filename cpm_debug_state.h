@@ -94,8 +94,29 @@ struct CPMDebugState
     int instructionsPerSecond = 0;
     double avgCyclesPerInstruction = 0.0;
 
+    // ─── NVRAM ───────────────────────────────────────────────────────────────
+    bool nvramAutoSave = false;  // salvar estado ao fechar a janela
+    char nvramPath[512] = {};    // caminho derivado do diskDir pelo emulador
+
     // ─── Speed throttle ─────────────────────────────────────────────────────
     double targetMHz = 0.0; // 0 = unlimited; otherwise throttle CPU to this speed
+
+    // ─── Detecção de Loop Infinito ───────────────────────────────────────────
+    // Pausa a execução se o PC ficar dentro de uma janela de 64 bytes por mais
+    // de STUCK_CYCLE_LIMIT ciclos consecutivos sem passar por BDOS/BIOS.
+    static constexpr uint64_t STUCK_CYCLE_LIMIT  = 20'000'000; // ~10s a 2 MHz
+    static constexpr uint16_t STUCK_WINDOW_BYTES = 64;
+
+    bool     stuckDetectionEnabled = true;
+    bool     stuckDetected         = false;
+    uint16_t stuckDetectedPC       = 0;
+    uint64_t stuckCycleCount       = 0;
+    uint16_t stuckWindowMin        = 0;
+    uint16_t stuckWindowMax        = 0;
+
+    void tickStuck(uint16_t newPC, uint8_t opCycles);
+    void resetStuckCounter();
+    void clearStuckDetected();
 
     // ─── Tabela de Símbolos ──────────────────────────────────────────────────
     std::unordered_map<uint16_t, std::string> symbols;
@@ -214,6 +235,45 @@ inline std::string CPMDebugState::getBdosDisplay()
     }
 
     return result;
+}
+
+// ─── Stuck / infinite-loop detection ─────────────────────────────────────────
+
+inline void CPMDebugState::tickStuck(uint16_t newPC, uint8_t opCycles)
+{
+    if (!stuckDetectionEnabled || stuckDetected) return;
+
+    if (stuckCycleCount == 0) {
+        stuckWindowMin = stuckWindowMax = newPC;
+    }
+    if (newPC < stuckWindowMin) stuckWindowMin = newPC;
+    if (newPC > stuckWindowMax) stuckWindowMax = newPC;
+
+    if ((uint16_t)(stuckWindowMax - stuckWindowMin) > STUCK_WINDOW_BYTES) {
+        stuckWindowMin = stuckWindowMax = newPC;
+        stuckCycleCount = opCycles;
+        return;
+    }
+
+    stuckCycleCount += opCycles;
+    if (stuckCycleCount >= STUCK_CYCLE_LIMIT) {
+        stuckDetected    = true;
+        stuckDetectedPC  = newPC;
+    }
+}
+
+inline void CPMDebugState::resetStuckCounter()
+{
+    stuckCycleCount = 0;
+    stuckWindowMin  = 0;
+    stuckWindowMax  = 0;
+}
+
+inline void CPMDebugState::clearStuckDetected()
+{
+    stuckDetected   = false;
+    stuckDetectedPC = 0;
+    resetStuckCounter();
 }
 
 #endif // CPM_DEBUG_STATE_H
