@@ -47,6 +47,9 @@ GameConfig LoadGameConfig(const std::string& exeDir, const std::string& gameName
                 else if (val == "visual200") cfg.cpmTerminal = TermType::VISUAL200;
                 else                         cfg.cpmTerminal = TermType::ADM3A;
             }
+            else if (key == "overlay_base") cfg.overlayBase = (uint16_t)std::stoi(val, nullptr, 16);
+            else if (key == "overlay_size") cfg.overlaySize = (uint16_t)std::stoi(val, nullptr, 16);
+            else if (key == "serial_port")  cfg.serialPort  = (uint16_t)std::stoi(val);
         } else {
             // filename or filename@0xADDR — explicit address is optional
             RomEntry entry;
