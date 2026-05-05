@@ -36,6 +36,14 @@ struct GameConfig {
     std::string cpmPrinter;
     // CP/M terminal type (default ADM3A)
     TermType cpmTerminal = TermType::ADM3A;
+    // Overlay region: address where the overlay area begins inside the TPA.
+    // 0 = no overlay region defined (entire TPA is resident code/data).
+    uint16_t overlayBase = 0;
+    // Size of the overlay region in bytes. 0 = extends to BDOS (0xF800).
+    uint16_t overlaySize = 0;
+    // Simulated serial port TCP port (0 = disabled).
+    // Connect with: nc localhost <serial_port>  or  telnet localhost <serial_port>
+    uint16_t serialPort = 0;
 };
 
 std::string GetExeDir();
