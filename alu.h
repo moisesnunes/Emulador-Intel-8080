@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include "intel8080.h"
 
+// Forward declaration — set to &cpm when running in CP/M mode, nullptr otherwise.
+struct CPMState;
+extern CPMState *g_serialState;
+
 uint16_t ReadWord(intel8080 *cpu, uint16_t pc);
 uint16_t AdvanceWord(intel8080 *const cpu);
 uint8_t ReadByte(intel8080 *cpu, uint16_t pc);
