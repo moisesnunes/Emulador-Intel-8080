@@ -574,6 +574,42 @@ void DrawTerminal(CPMState &cpm)
     ImGui::PopStyleColor(5);
 }
 
+static void DrawPrinterWindow(CPMState &cpm)
+{
+    if (!cpm.printerWindowOpen)
+        return;
+    ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Impressora Virtual (LPT)", &cpm.printerWindowOpen)) {
+        ImGui::End();
+        return;
+    }
+
+    // Scrollable read-only text with auto-scroll when new content arrives.
+    static size_t lastLen = 0;
+    bool newContent = cpm.printerBuffer.size() != lastLen;
+    lastLen = cpm.printerBuffer.size();
+
+    ImGui::BeginChild("##lptscroll", ImVec2(-1, -ImGui::GetFrameHeightWithSpacing()), false);
+    ImGui::TextUnformatted(cpm.printerBuffer.c_str(),
+                           cpm.printerBuffer.c_str() + cpm.printerBuffer.size());
+    if (newContent)
+        ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+
+    if (ImGui::Button("Limpar")) {
+        cpm.printerBuffer.clear();
+        lastLen = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Abrir arquivo")) {
+        std::string path = !cpm.printerPath.empty()
+            ? cpm.printerPath
+            : (!cpm.diskDirs[0].empty() ? cpm.diskDirs[0] : ".") + "/CPM.LST";
+        system(("xdg-open " + path + " &").c_str());
+    }
+    ImGui::End();
+}
+
 void ImGUIFrameCPM(CPMState &cpm, intel8080 *cpu, CPMDebugState &dbg)
 {
     ImGui_ImplOpenGL3_NewFrame();
@@ -582,6 +618,7 @@ void ImGUIFrameCPM(CPMState &cpm, intel8080 *cpu, CPMDebugState &dbg)
 
     DrawTerminal(cpm);
     DrawCPMDebugger(cpu, cpm, dbg);
+    DrawPrinterWindow(cpm);
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
