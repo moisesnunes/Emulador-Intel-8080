@@ -8,6 +8,7 @@
 #include "cpm_bios.h"
 #include "cpm_debug_state.h"
 #include <algorithm>
+#include <unistd.h>
 
 // ─── Helpers visuais ──────────────────────────────────────────────────────────
 
@@ -215,6 +216,39 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
         ImGui::TextDisabled("(inativo — abre ao primeiro byte enviado)");
     }
 
+    // Serial port (TCP)
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Serial (TCP)");
+    if (cpm.serial.enabled()) {
+        ImGui::Text("Porta: %d", (int)cpm.serial.port);
+        ImGui::SameLine();
+        if (cpm.serial.connected()) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "CONECTADO");
+            ImGui::SameLine();
+            ImGui::Text("rx=%d tx=%d",
+                        (int)cpm.serial.rxBuf.size(),
+                        (int)cpm.serial.txBuf.size());
+            ImGui::SameLine();
+            if (ImGui::Button("Desconectar##ser")) {
+                if (cpm.serial.clientFd >= 0) {
+                    close(cpm.serial.clientFd);
+                    cpm.serial.clientFd = -1;
+                    cpm.serial.rxBuf.clear();
+                    cpm.serial.txBuf.clear();
+                }
+            }
+        } else if (cpm.serial.listenFd >= 0) {
+            ImGui::TextDisabled("aguardando conexão...");
+            ImGui::SameLine();
+            ImGui::TextDisabled("nc localhost %d", (int)cpm.serial.port);
+        } else {
+            ImGui::TextDisabled("inativo");
+        }
+    } else {
+        ImGui::TextDisabled("desabilitado (serial_port = 0 em game.cfg)");
+    }
+    ImGui::Separator();
+
     // Printer (fn 5)
     ImGui::Text("LST (fn 5):");
     ImGui::SameLine();
@@ -236,6 +270,9 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
     {
         ImGui::TextDisabled("(inativo — abre ao primeiro byte enviado)");
     }
+    ImGui::SameLine();
+    if (ImGui::Button(cpm.printerWindowOpen ? "Ocultar janela##lst" : "Ver janela##lst"))
+        cpm.printerWindowOpen = !cpm.printerWindowOpen;
 }
 
 // ─── Helpers para disassembler prospectivo ────────────────────────────────────
@@ -781,7 +818,33 @@ static void CPMDebugPanel_ExecutionControl(intel8080 *cpu, CPMState &cpm, CPMDeb
 
     ImGui::Separator();
 
-    // Save / Load State
+    // NVRAM (auto-save / auto-load)
+    ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "NVRAM");
+    ImGui::Checkbox("Auto-salvar ao fechar", &dbg.nvramAutoSave);
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##nvram_path", dbg.nvramPath, sizeof(dbg.nvramPath));
+    if (ImGui::Button("Salvar agora##nvram", ImVec2(120, 0)))
+        if (SaveCPMState(cpu, cpm, std::string(dbg.nvramPath)))
+            ImGui::OpenPopup("##nvram_saved_ok");
+    ImGui::SameLine();
+    if (ImGui::Button("Restaurar##nvram", ImVec2(100, 0)))
+        if (LoadCPMState(cpu, cpm, std::string(dbg.nvramPath)))
+            ImGui::OpenPopup("##nvram_loaded_ok");
+    if (ImGui::BeginPopup("##nvram_saved_ok"))
+    {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), " NVRAM salva! ");
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopup("##nvram_loaded_ok"))
+    {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), " NVRAM restaurada! ");
+        ImGui::EndPopup();
+    }
+
+    ImGui::Separator();
+
+    // Save / Load State (snapshot nomeado)
+    ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.5f, 1.0f), "Snapshot");
     static char savePath[512] = "cpm_state.bin";
     ImGui::SetNextItemWidth(180);
     ImGui::InputText("##savepath", savePath, sizeof(savePath));
@@ -803,6 +866,32 @@ static void CPMDebugPanel_ExecutionControl(intel8080 *cpu, CPMState &cpm, CPMDeb
     {
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), " Estado carregado! ");
         ImGui::EndPopup();
+    }
+
+    ImGui::Separator();
+
+    // Detecção de loop infinito
+    ImGui::Checkbox("Detectar loop infinito", &dbg.stuckDetectionEnabled);
+    if (dbg.stuckDetectionEnabled && !dbg.stuckDetected && dbg.stuckCycleCount > 0)
+    {
+        float progress = (float)dbg.stuckCycleCount / (float)CPMDebugState::STUCK_CYCLE_LIMIT;
+        ImGui::ProgressBar(progress, ImVec2(-1.0f, 6.0f));
+    }
+    if (dbg.stuckDetected)
+    {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.2f, 1.0f),
+                           "STUCK: loop detectado em PC=0x%04X", dbg.stuckDetectedPC);
+        ImGui::TextDisabled("(%llu ciclos na mesma regiao)",
+                            (unsigned long long)dbg.stuckCycleCount);
+        if (ImGui::Button("Retomar##stuck"))
+        {
+            dbg.clearStuckDetected();
+            dbg.notHalted = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Manter pausado##stuck"))
+            dbg.clearStuckDetected();
     }
 
     ImGui::Separator();
