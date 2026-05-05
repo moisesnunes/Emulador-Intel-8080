@@ -1,6 +1,10 @@
 #include "alu.h"
 #include "intel8080.h"
-// class intel8080;
+#include "cpm_bios.h"
+
+// Global pointer set by the CP/M emulator so MachineIn/Out can access serial state.
+// Null when running in arcade mode.
+CPMState *g_serialState = nullptr;
 
 uint16_t ReadWord(intel8080 *cpu, uint16_t pc)
 {
@@ -565,6 +569,23 @@ void MachineIn(intel8080 *cpu)
     case 3:
         cpu->A = (cpu->shiftRegister >> (8 - cpu->shiftOffset)) & 0xFF;
         break;
+    // 8251 USART simulation: port 0x10 = data, port 0x11 = status.
+    // Active only when a serial port is configured (g_serialState != nullptr).
+    case 0x10: // USART data read — pop one byte from rxBuf
+        if (g_serialState && g_serialState->serial.connected() &&
+            !g_serialState->serial.rxBuf.empty()) {
+            cpu->A = g_serialState->serial.rxBuf.front();
+            g_serialState->serial.rxBuf.pop_front();
+        } else {
+            cpu->A = 0x00;
+        }
+        break;
+    case 0x11: // USART status — bit 0 = RxRDY, bit 1 = TxRDY (always 1)
+        cpu->A = 0x02; // TxRDY always set
+        if (g_serialState && g_serialState->serial.connected() &&
+            !g_serialState->serial.rxBuf.empty())
+            cpu->A |= 0x01; // RxRDY
+        break;
     }
 }
 
@@ -577,10 +598,19 @@ void MachineOut(intel8080 *cpu)
     case 2:
         cpu->shiftOffset = cpu->A & 0x07;
         break;
-    case 4:
+    case 4: {
         uint16_t mask = 0xFF00;
         uint16_t value = cpu->A << 8;
         cpu->shiftRegister &= !(mask >> cpu->shiftOffset);
         cpu->shiftRegister |= value >> cpu->shiftOffset;
+        break;
+    }
+    // 8251 USART simulation: port 0x10 = data write.
+    case 0x10: // USART data write — push byte to txBuf
+        if (g_serialState && g_serialState->serial.connected())
+            g_serialState->serial.txBuf.push_back(cpu->A);
+        break;
+    case 0x11: // USART command/mode write — ignored (no mode register emulated)
+        break;
     }
 }
