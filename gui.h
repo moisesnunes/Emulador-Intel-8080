@@ -29,6 +29,10 @@ void RenderDebugData(long long &oneInstructionCycle, bool &notHalted, bool &runO
 void DrawScreen(intel8080 *cpu, unsigned int shaderProgram, unsigned int VAO, unsigned int texture,
                 int vramStart, int vramEnd, int screenW, int screenH);
 
+// Render a pre-built 256×192 RGB pixel buffer (from the TMS9918A) to the quad.
+void DrawMSXScreen(unsigned int shaderProgram, unsigned int VAO, unsigned int texture,
+                   const uint8_t *rgb256x192);
+
 void GraphicsCleanup(unsigned int VAO, unsigned int shaderProgram);
 
 // ── CP/M debug state ──────────────────────────────────────────────────────────
