@@ -15,22 +15,28 @@ public:
 
     uint32_t cycles, cyclesInterrupt;
 
-    uint8_t IOPorts[256];  // 8080 address space for IN/OUT has 256 ports (0x00-0xFF)
+    uint8_t IOPorts[256]; // 8080 address space for IN/OUT has 256 ports (0x00-0xFF)
     uint16_t shiftRegister;
     uint8_t shiftOffset;
 
-    // When true, WriteMem mirrors writes across the Space Invaders VRAM banks
-    // and ignores writes to the ROM area (0x0000-0x1FFF). Set to false for
-    // CP/M mode, where all 64 KB are writable RAM.
+    // When true, WriteMem mirrors writes across the Space Invaders VRAM banks.
+    // ROM protection is handled separately by memWritable regardless of this flag.
     bool arcadeMode = true;
 
     uint16_t SP, PC;
 
     uint8_t memory[0x10000];
+    // One bit per address: 1 = writable (RAM), 0 = read-only (ROM/EPROM).
+    // Default: all bits set (all writable). Call SetRomRegion() to protect regions.
+    uint8_t memWritable[0x10000 / 8];
 
     intel8080();
     void WriteMem(uint16_t address, uint16_t value);
     void Set_SZP_Flags(uint16_t val);
+    // Mark addr..(addr+size-1) as read-only (ROM/EPROM).
+    void SetRomRegion(uint16_t addr, uint16_t size);
+    // Mark addr..(addr+size-1) as writable (RAM).
+    void SetRamRegion(uint16_t addr, uint16_t size);
 };
 
 void ExecuteOpCode(uint8_t OpCode, intel8080 *cpu);
