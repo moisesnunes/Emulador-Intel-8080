@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <termios.h>
 
 // Per-FCB search context for fn 17/18 (Search First/Next).
 struct SearchContext
@@ -244,20 +245,47 @@ struct TerminalState
 static constexpr int MAX_DRIVES = 16; // A: through P:
 
 // ── Simulated serial port ─────────────────────────────────────────────────────
-// Provides a bidirectional byte stream over a TCP loopback socket.
-// Connect with: telnet localhost <port>  or  nc localhost <port>
-// BDOS fn 3 (Reader) reads from rxBuf; fn 4 (Punch) writes to txBuf.
-// SerialTick() must be called each emulation frame to pump the socket.
+// Supports two modes:
+//  1. TCP loopback: server socket listening on 'port'
+//  2. FIFO (named pipe): bidirectional FIFO at 'fifoPath'
+// Both modes respect baud rate for realistic byte transfer timing.
+// SerialTick() must be called each emulation frame to pump the serial port.
 struct SimSerial
 {
-    int listenFd = -1;         // server socket (-1 = not yet bound)
-    int clientFd = -1;         // connected client (-1 = none)
-    uint16_t port = 0;         // TCP port; 0 = disabled
-    std::deque<uint8_t> rxBuf; // bytes received from client → Reader
-    std::deque<uint8_t> txBuf; // bytes queued for client ← Punch
+    // TCP mode:
+    int listenFd = -1;  // server socket (-1 = not yet bound)
+    int clientFd = -1;  // connected client (-1 = none)
+    uint16_t port = 0;  // TCP port; 0 = disabled in TCP mode
 
-    bool enabled() const { return port != 0; }
-    bool connected() const { return clientFd >= 0; }
+    // FIFO mode:
+    int fifoFd = -1;    // FIFO file descriptor (-1 = not yet opened)
+    std::string fifoPath;  // FIFO path; empty = use TCP mode
+    bool fifoReadEnd = false;  // true if we have the read end (non-blocking)
+    bool fifoWriteEnd = false; // true if we have the write end
+
+    // Console mode: route I/O directly through stdin/stdout (no TCP/FIFO).
+    // game.cfg: serial_console=yes
+    bool consoleMode = false;
+    bool consoleInitialized = false; // true after stdin set to raw/non-blocking
+    struct termios consoleSavedTermios {}; // saved terminal state for restore
+
+    // Baud rate (affects byte transfer timing):
+    uint32_t baud = 9600;
+
+    // Buffers:
+    std::deque<uint8_t> rxBuf; // bytes received from serial → Reader (BDOS fn 3)
+    std::deque<uint8_t> txBuf; // bytes queued for serial ← Punch (BDOS fn 4)
+
+    // Throttling (bytes-per-second): 9600 baud = ~1200 bytes/sec
+    // Each byte takes ~8.3ms at 9600 baud.
+    // Using CPU cycles: 2MHz CPU × 8.3ms/byte ≈ 16,640 cycles/byte.
+    // Simplified: throttle based on cycle count, allow N bytes per frame.
+    uint64_t lastByteTimeMs = 0;  // last byte transferred (wall clock ms)
+    int bytesThisMs = 0;           // bytes transferred in current ms interval
+
+    bool enabled()    const { return consoleMode || (port != 0) || !fifoPath.empty(); }
+    bool connected()  const { return consoleMode || (clientFd >= 0) || (fifoFd >= 0); }
+    bool isTcpMode()  const { return !fifoPath.empty() && fifoPath[0] == '/'; }
 };
 
 // ── CP/M emulator state ───────────────────────────────────────────────────────
