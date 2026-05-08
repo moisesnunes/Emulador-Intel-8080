@@ -67,14 +67,15 @@ struct CPMDebugState
     bool inBdos = false;         // Atualmente dentro de BDOS?
 
     // ─── BDOS History ────────────────────────────────────────────────────────
-    struct BdosLogEntry {
-        uint8_t fn    = 0xFF;
-        bool    valid = false;
+    struct BdosLogEntry
+    {
+        uint8_t fn = 0xFF;
+        bool valid = false;
     };
     static constexpr int BDOS_LOG_MAX = 32;
     BdosLogEntry bdosLog[BDOS_LOG_MAX] = {};
-    int          bdosLogHead  = 0;
-    int          bdosLogCount = 0;
+    int bdosLogHead = 0;
+    int bdosLogCount = 0;
     void logBdosCall(uint8_t fn);
 
     // ─── Terminal State ─────────────────────────────────────────────────────
@@ -95,8 +96,8 @@ struct CPMDebugState
     double avgCyclesPerInstruction = 0.0;
 
     // ─── NVRAM ───────────────────────────────────────────────────────────────
-    bool nvramAutoSave = false;  // salvar estado ao fechar a janela
-    char nvramPath[512] = {};    // caminho derivado do diskDir pelo emulador
+    bool nvramAutoSave = false; // salvar estado ao fechar a janela
+    char nvramPath[512] = {};   // caminho derivado do diskDir pelo emulador
 
     // ─── Speed throttle ─────────────────────────────────────────────────────
     double targetMHz = 0.0; // 0 = unlimited; otherwise throttle CPU to this speed
@@ -104,15 +105,15 @@ struct CPMDebugState
     // ─── Detecção de Loop Infinito ───────────────────────────────────────────
     // Pausa a execução se o PC ficar dentro de uma janela de 64 bytes por mais
     // de STUCK_CYCLE_LIMIT ciclos consecutivos sem passar por BDOS/BIOS.
-    static constexpr uint64_t STUCK_CYCLE_LIMIT  = 20'000'000; // ~10s a 2 MHz
+    static constexpr uint64_t STUCK_CYCLE_LIMIT = 20'000'000; // ~10s a 2 MHz
     static constexpr uint16_t STUCK_WINDOW_BYTES = 64;
 
-    bool     stuckDetectionEnabled = true;
-    bool     stuckDetected         = false;
-    uint16_t stuckDetectedPC       = 0;
-    uint64_t stuckCycleCount       = 0;
-    uint16_t stuckWindowMin        = 0;
-    uint16_t stuckWindowMax        = 0;
+    bool stuckDetectionEnabled = true;
+    bool stuckDetected = false;
+    uint16_t stuckDetectedPC = 0;
+    uint64_t stuckCycleCount = 0;
+    uint16_t stuckWindowMin = 0;
+    uint16_t stuckWindowMax = 0;
 
     void tickStuck(uint16_t newPC, uint8_t opCycles);
     void resetStuckCounter();
@@ -135,7 +136,7 @@ struct CPMDebugState
     std::string getBdosDisplay();
     std::string getStackDisplay(class intel8080 *cpu);
 
-    void        loadSymbols(const char *path);
+    void loadSymbols(const char *path);
     const char *resolveSymbol(uint16_t addr) const;
 };
 
@@ -204,7 +205,7 @@ inline void CPMDebugState::updateBdosInfo(uint8_t function)
 inline void CPMDebugState::logBdosCall(uint8_t fn)
 {
     int idx = bdosLogHead % BDOS_LOG_MAX;
-    bdosLog[idx].fn    = fn;
+    bdosLog[idx].fn = fn;
     bdosLog[idx].valid = true;
     bdosLogHead++;
     if (bdosLogCount < BDOS_LOG_MAX)
@@ -241,37 +242,43 @@ inline std::string CPMDebugState::getBdosDisplay()
 
 inline void CPMDebugState::tickStuck(uint16_t newPC, uint8_t opCycles)
 {
-    if (!stuckDetectionEnabled || stuckDetected) return;
+    if (!stuckDetectionEnabled || stuckDetected)
+        return;
 
-    if (stuckCycleCount == 0) {
+    if (stuckCycleCount == 0)
+    {
         stuckWindowMin = stuckWindowMax = newPC;
     }
-    if (newPC < stuckWindowMin) stuckWindowMin = newPC;
-    if (newPC > stuckWindowMax) stuckWindowMax = newPC;
+    if (newPC < stuckWindowMin)
+        stuckWindowMin = newPC;
+    if (newPC > stuckWindowMax)
+        stuckWindowMax = newPC;
 
-    if ((uint16_t)(stuckWindowMax - stuckWindowMin) > STUCK_WINDOW_BYTES) {
+    if ((uint16_t)(stuckWindowMax - stuckWindowMin) > STUCK_WINDOW_BYTES)
+    {
         stuckWindowMin = stuckWindowMax = newPC;
         stuckCycleCount = opCycles;
         return;
     }
 
     stuckCycleCount += opCycles;
-    if (stuckCycleCount >= STUCK_CYCLE_LIMIT) {
-        stuckDetected    = true;
-        stuckDetectedPC  = newPC;
+    if (stuckCycleCount >= STUCK_CYCLE_LIMIT)
+    {
+        stuckDetected = true;
+        stuckDetectedPC = newPC;
     }
 }
 
 inline void CPMDebugState::resetStuckCounter()
 {
     stuckCycleCount = 0;
-    stuckWindowMin  = 0;
-    stuckWindowMax  = 0;
+    stuckWindowMin = 0;
+    stuckWindowMax = 0;
 }
 
 inline void CPMDebugState::clearStuckDetected()
 {
-    stuckDetected   = false;
+    stuckDetected = false;
     stuckDetectedPC = 0;
     resetStuckCounter();
 }
