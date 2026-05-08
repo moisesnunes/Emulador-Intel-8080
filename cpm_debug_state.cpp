@@ -176,9 +176,9 @@ std::string CPMDebugState::getInstructionDisplay(int index)
              DISSAMBLER_STATES[log.opcode],
              log.A, log.B, log.C, log.D, log.E, log.H, log.L,
              log.SP,
-             log.carry  ? "C" : "-",
-             log.zero   ? "Z" : "-",
-             log.sign   ? "S" : "-",
+             log.carry ? "C" : "-",
+             log.zero ? "Z" : "-",
+             log.sign ? "S" : "-",
              log.parity ? "P" : "-");
 
     return std::string(buffer);
@@ -196,29 +196,34 @@ void CPMDebugState::loadSymbols(const char *path)
 {
     symbols.clear();
     FILE *fp = fopen(path, "r");
-    if (!fp) return;
+    if (!fp)
+        return;
 
     char line[256];
     while (fgets(line, sizeof(line), fp))
     {
         char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
         if (*p == ';' || *p == '#' || *p == '\0' || *p == '\n' || *p == '\r')
             continue;
 
         char *endAddr;
         uint16_t addr = (uint16_t)strtoul(p, &endAddr, 16);
-        if (endAddr == p) continue;
+        if (endAddr == p)
+            continue;
 
-        while (*endAddr == ' ' || *endAddr == '\t') endAddr++;
-        if (*endAddr == '\0' || *endAddr == '\n' || *endAddr == '\r') continue;
+        while (*endAddr == ' ' || *endAddr == '\t')
+            endAddr++;
+        if (*endAddr == '\0' || *endAddr == '\n' || *endAddr == '\r')
+            continue;
 
         char name[64];
         strncpy(name, endAddr, sizeof(name) - 1);
         name[sizeof(name) - 1] = '\0';
         int len = (int)strlen(name);
-        while (len > 0 && (name[len-1] == '\n' || name[len-1] == '\r' ||
-                           name[len-1] == ' '  || name[len-1] == '\t'))
+        while (len > 0 && (name[len - 1] == '\n' || name[len - 1] == '\r' ||
+                           name[len - 1] == ' ' || name[len - 1] == '\t'))
             name[--len] = '\0';
 
         if (len > 0)
