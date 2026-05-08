@@ -36,7 +36,7 @@ static void DrawRegistersTab(intel8080 *cpu)
     ImGui::Separator();
 
     if (ImGui::BeginTable("##regs", 4,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit))
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit))
     {
         ImGui::TableSetupColumn(" A  ");
         ImGui::TableSetupColumn(" BC ");
@@ -45,10 +45,14 @@ static void DrawRegistersTab(intel8080 *cpu)
         ImGui::TableHeadersRow();
 
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::Text(" %02X  ", cpu->A);
-        ImGui::TableNextColumn(); ImGui::Text("%02X %02X", cpu->B, cpu->C);
-        ImGui::TableNextColumn(); ImGui::Text("%02X %02X", cpu->D, cpu->E);
-        ImGui::TableNextColumn(); ImGui::Text("%02X %02X", cpu->H, cpu->L);
+        ImGui::TableNextColumn();
+        ImGui::Text(" %02X  ", cpu->A);
+        ImGui::TableNextColumn();
+        ImGui::Text("%02X %02X", cpu->B, cpu->C);
+        ImGui::TableNextColumn();
+        ImGui::Text("%02X %02X", cpu->D, cpu->E);
+        ImGui::TableNextColumn();
+        ImGui::Text("%02X %02X", cpu->H, cpu->L);
 
         ImGui::EndTable();
     }
@@ -56,10 +60,10 @@ static void DrawRegistersTab(intel8080 *cpu)
     ImGui::Spacing();
     ImGui::Text("Flags: ");
     ImGui::SameLine();
-    FlagBadge("C",  cpu->cf);
-    FlagBadge("Z",  cpu->zf);
-    FlagBadge("S",  cpu->sf);
-    FlagBadge("P",  cpu->pf);
+    FlagBadge("C", cpu->cf);
+    FlagBadge("Z", cpu->zf);
+    FlagBadge("S", cpu->sf);
+    FlagBadge("P", cpu->pf);
     FlagBadge("AC", cpu->acf);
     ImGui::NewLine();
 
@@ -87,9 +91,9 @@ static void DrawRegistersTab(intel8080 *cpu)
 static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
 {
     if (ImGui::BeginTable("##drives", 3,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
-            ImGuiTableFlags_ScrollY,
-            ImVec2(0, 130)))
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
+                              ImGuiTableFlags_ScrollY,
+                          ImVec2(0, 130)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Dr", ImGuiTableColumnFlags_WidthFixed, 28.0f);
@@ -101,13 +105,14 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
         {
             bool hasDsk = cpm.diskImages[i] && cpm.diskImages[i]->isOpen();
             bool hasDir = !cpm.diskDirs[i].empty();
-            if (!hasDsk && !hasDir) continue;
+            if (!hasDsk && !hasDir)
+                continue;
             bool active = (cpm.currentDrive == i);
 
             ImGui::TableNextRow();
             if (active)
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                    ImGui::GetColorU32(ImVec4(0.15f, 0.4f, 0.15f, 0.5f)));
+                                       ImGui::GetColorU32(ImVec4(0.15f, 0.4f, 0.15f, 0.5f)));
 
             ImGui::TableNextColumn();
             ImGui::Text("%c%s", 'A' + i, active ? "<" : ":");
@@ -131,14 +136,17 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
     ImGui::Text("User:    %d", cpm.currentUser);
     ImGui::Text("DMA:     0x%04X", cpm.dmaAddress);
 
-    auto statusColor = [](bool v) -> ImVec4 {
+    auto statusColor = [](bool v) -> ImVec4
+    {
         return v ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
     };
 
-    ImGui::Text("CCP:     "); ImGui::SameLine();
+    ImGui::Text("CCP:     ");
+    ImGui::SameLine();
     ImGui::TextColored(statusColor(cpm.ccpRunning), "%s", cpm.ccpRunning ? "RUNNING" : "OFF");
 
-    ImGui::Text("Running: "); ImGui::SameLine();
+    ImGui::Text("Running: ");
+    ImGui::SameLine();
     ImGui::TextColored(statusColor(cpm.running), "%s", cpm.running ? "YES" : "NO");
 
     ImGui::Separator();
@@ -182,7 +190,8 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
     if (cpm.readerFp)
     {
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "OPEN");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fechar o arquivo reader");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Fechar o arquivo reader");
         if (ImGui::Button("X##rdr_close"))
         {
             fclose(cpm.readerFp);
@@ -203,7 +212,8 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s/CPM.PUN",
                            d.c_str());
         ImGui::SameLine();
-        if (ImGui::Button("Flush##pun"))  fflush(cpm.punchFp);
+        if (ImGui::Button("Flush##pun"))
+            fflush(cpm.punchFp);
         ImGui::SameLine();
         if (ImGui::Button("Fechar##pun"))
         {
@@ -219,32 +229,42 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
     // Serial port (TCP)
     ImGui::Separator();
     ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Serial (TCP)");
-    if (cpm.serial.enabled()) {
+    if (cpm.serial.enabled())
+    {
         ImGui::Text("Porta: %d", (int)cpm.serial.port);
         ImGui::SameLine();
-        if (cpm.serial.connected()) {
+        if (cpm.serial.connected())
+        {
             ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "CONECTADO");
             ImGui::SameLine();
             ImGui::Text("rx=%d tx=%d",
                         (int)cpm.serial.rxBuf.size(),
                         (int)cpm.serial.txBuf.size());
             ImGui::SameLine();
-            if (ImGui::Button("Desconectar##ser")) {
-                if (cpm.serial.clientFd >= 0) {
+            if (ImGui::Button("Desconectar##ser"))
+            {
+                if (cpm.serial.clientFd >= 0)
+                {
                     close(cpm.serial.clientFd);
                     cpm.serial.clientFd = -1;
                     cpm.serial.rxBuf.clear();
                     cpm.serial.txBuf.clear();
                 }
             }
-        } else if (cpm.serial.listenFd >= 0) {
+        }
+        else if (cpm.serial.listenFd >= 0)
+        {
             ImGui::TextDisabled("aguardando conexão...");
             ImGui::SameLine();
             ImGui::TextDisabled("nc localhost %d", (int)cpm.serial.port);
-        } else {
+        }
+        else
+        {
             ImGui::TextDisabled("inativo");
         }
-    } else {
+    }
+    else
+    {
         ImGui::TextDisabled("desabilitado (serial_port = 0 em game.cfg)");
     }
     ImGui::Separator();
@@ -258,7 +278,8 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s/CPM.LST",
                            d.c_str());
         ImGui::SameLine();
-        if (ImGui::Button("Flush##lst"))  fflush(cpm.printerFp);
+        if (ImGui::Button("Flush##lst"))
+            fflush(cpm.printerFp);
         ImGui::SameLine();
         if (ImGui::Button("Fechar##lst"))
         {
@@ -280,8 +301,10 @@ static void DrawCPMTab(CPMState &cpm, CPMDebugState &dbg)
 static int InstrSize(uint8_t op)
 {
     const char *mn = DISSAMBLER_STATES[op];
-    if (strstr(mn, "D16") || strstr(mn, "A16")) return 3;
-    if (strstr(mn, "D8"))                        return 2;
+    if (strstr(mn, "D16") || strstr(mn, "A16"))
+        return 3;
+    if (strstr(mn, "D8"))
+        return 2;
     return 1;
 }
 
@@ -289,13 +312,17 @@ static int InstrSize(uint8_t op)
 static ImVec4 InstrColor(uint8_t op)
 {
     const char *mn = DISSAMBLER_STATES[op];
-    if (op == 0x76)                          return ImVec4(1.0f, 0.25f, 0.25f, 1.0f); // HLT
+    if (op == 0x76)
+        return ImVec4(1.0f, 0.25f, 0.25f, 1.0f); // HLT
     if (strncmp(mn, "RET", 3) == 0 ||
-        mn[0] == 'R')                        return ImVec4(1.0f, 0.55f, 0.55f, 1.0f); // RET/Rcc
+        mn[0] == 'R')
+        return ImVec4(1.0f, 0.55f, 0.55f, 1.0f); // RET/Rcc
     if (strncmp(mn, "CALL", 4) == 0 ||
-        mn[0] == 'C')                        return ImVec4(1.0f, 0.75f, 0.25f, 1.0f); // CALL/Ccc
+        mn[0] == 'C')
+        return ImVec4(1.0f, 0.75f, 0.25f, 1.0f); // CALL/Ccc
     if (strncmp(mn, "JMP", 3) == 0 ||
-        mn[0] == 'J')                        return ImVec4(1.0f, 1.0f, 0.35f, 1.0f);  // JMP/Jcc
+        mn[0] == 'J')
+        return ImVec4(1.0f, 1.0f, 0.35f, 1.0f); // JMP/Jcc
     if (strncmp(mn, "MOV", 3) == 0 ||
         strncmp(mn, "MVI", 3) == 0 ||
         strncmp(mn, "LXI", 3) == 0 ||
@@ -304,16 +331,19 @@ static ImVec4 InstrColor(uint8_t op)
         strncmp(mn, "LDAX", 4) == 0 ||
         strncmp(mn, "STAX", 4) == 0 ||
         strncmp(mn, "LHLD", 4) == 0 ||
-        strncmp(mn, "SHLD", 4) == 0)        return ImVec4(0.75f, 0.85f, 1.0f, 1.0f);  // mov/load/store
-    return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);                                             // default
+        strncmp(mn, "SHLD", 4) == 0)
+        return ImVec4(0.75f, 0.85f, 1.0f, 1.0f); // mov/load/store
+    return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);       // default
 }
 
 // Formata operando de 16 bits com fallback para símbolo.
 static void Fmt16(char *out, size_t sz, uint16_t imm, const CPMDebugState *dbg)
 {
     const char *sym = dbg ? dbg->resolveSymbol(imm) : nullptr;
-    if (sym) snprintf(out, sz, "%s", sym);
-    else     snprintf(out, sz, "0x%04X", imm);
+    if (sym)
+        snprintf(out, sz, "%s", sym);
+    else
+        snprintf(out, sz, "0x%04X", imm);
 }
 
 // Formata instrução com operandos resolvidos e nomes de símbolo quando disponíveis.
@@ -394,8 +424,8 @@ static void DrawInstructionsTab(intel8080 *cpu, CPMDebugState &dbg)
             }
         }
 
-        uint8_t op   = cpu->memory[addr];
-        int     size = InstrSize(op);
+        uint8_t op = cpu->memory[addr];
+        int size = InstrSize(op);
 
         char mnem[56];
         FormatInstrWithOperands(mnem, sizeof(mnem), addr, cpu->memory, &dbg);
@@ -406,13 +436,13 @@ static void DrawInstructionsTab(intel8080 *cpu, CPMDebugState &dbg)
         case 3:
             snprintf(line, sizeof(line), "%04X: %02X %02X %02X  %-24s",
                      addr, op,
-                     cpu->memory[(uint16_t)(addr+1)],
-                     cpu->memory[(uint16_t)(addr+2)], mnem);
+                     cpu->memory[(uint16_t)(addr + 1)],
+                     cpu->memory[(uint16_t)(addr + 2)], mnem);
             break;
         case 2:
             snprintf(line, sizeof(line), "%04X: %02X %02X      %-24s",
                      addr, op,
-                     cpu->memory[(uint16_t)(addr+1)], mnem);
+                     cpu->memory[(uint16_t)(addr + 1)], mnem);
             break;
         default:
             snprintf(line, sizeof(line), "%04X: %02X         %-24s",
@@ -527,8 +557,8 @@ static void DrawStackTab(intel8080 *cpu, CPMDebugState &dbg)
     ImGui::Separator();
 
     if (ImGui::BeginTable("##stack", 4,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
-            ImGuiTableFlags_RowBg))
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
+                              ImGuiTableFlags_RowBg))
     {
         ImGui::TableSetupColumn("Offset");
         ImGui::TableSetupColumn("Endereço");
@@ -539,21 +569,24 @@ static void DrawStackTab(intel8080 *cpu, CPMDebugState &dbg)
         for (int i = 0; i < 12; i++)
         {
             uint16_t stackAddr = (uint16_t)(cpu->SP + i * 2);
-            uint16_t val = (uint16_t)((cpu->memory[(uint16_t)(stackAddr+1)] << 8) |
-                                       cpu->memory[stackAddr]);
+            uint16_t val = (uint16_t)((cpu->memory[(uint16_t)(stackAddr + 1)] << 8) |
+                                      cpu->memory[stackAddr]);
             const char *sym = dbg.resolveSymbol(val);
 
             ImGui::TableNextRow();
             if (i == 0)
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                    ImGui::GetColorU32(ImVec4(0.2f, 0.45f, 0.2f, 0.45f)));
+                                       ImGui::GetColorU32(ImVec4(0.2f, 0.45f, 0.2f, 0.45f)));
 
             ImVec4 valColor = (i == 0) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
                                        : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
 
-            ImGui::TableNextColumn(); ImGui::Text("SP+%02d", i * 2);
-            ImGui::TableNextColumn(); ImGui::Text("0x%04X", stackAddr);
-            ImGui::TableNextColumn(); ImGui::TextColored(valColor, "0x%04X", val);
+            ImGui::TableNextColumn();
+            ImGui::Text("SP+%02d", i * 2);
+            ImGui::TableNextColumn();
+            ImGui::Text("0x%04X", stackAddr);
+            ImGui::TableNextColumn();
+            ImGui::TextColored(valColor, "0x%04X", val);
             ImGui::TableNextColumn();
             if (sym)
                 ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "%s", sym);
@@ -613,16 +646,18 @@ static void DrawSymbolsTab(CPMDebugState &dbg)
     for (auto &kv : dbg.symbols)
         sorted.push_back({kv.first, &kv.second});
     std::sort(sorted.begin(), sorted.end(),
-              [](auto &a, auto &b){ return a.first < b.first; });
+              [](auto &a, auto &b)
+              { return a.first < b.first; });
 
     std::string flt(filterBuf);
     // lowercase para comparação case-insensitive
-    for (char &c : flt) c = (char)tolower((unsigned char)c);
+    for (char &c : flt)
+        c = (char)tolower((unsigned char)c);
 
     if (ImGui::BeginTable("##sym_table", 2,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-            ImVec2(0, -4)))
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, -4)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Endereço", ImGuiTableColumnFlags_WidthFixed, 75.0f);
@@ -635,7 +670,8 @@ static void DrawSymbolsTab(CPMDebugState &dbg)
             {
                 // checar se nome ou endereço hex contém o filtro
                 std::string nameLow(*namePtr);
-                for (char &c : nameLow) c = (char)tolower((unsigned char)c);
+                for (char &c : nameLow)
+                    c = (char)tolower((unsigned char)c);
                 char addrHex[8];
                 snprintf(addrHex, sizeof(addrHex), "%04x", addr);
                 if (nameLow.find(flt) == std::string::npos &&
@@ -670,19 +706,18 @@ static void DrawBdosTab(CPMDebugState &dbg)
         ImGui::TextDisabled("Nenhuma chamada BDOS registrada ainda.");
     }
     else if (ImGui::BeginTable("##bdos_table", 2,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-            ImVec2(0, -4)))
+                               ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit |
+                                   ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                               ImVec2(0, -4)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Fn#",  ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        ImGui::TableSetupColumn("Fn#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
         ImGui::TableSetupColumn("Função BDOS");
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < dbg.bdosLogCount; i++)
         {
-            int idx = (dbg.bdosLogHead - 1 - i + CPMDebugState::BDOS_LOG_MAX * 2)
-                      % CPMDebugState::BDOS_LOG_MAX;
+            int idx = (dbg.bdosLogHead - 1 - i + CPMDebugState::BDOS_LOG_MAX * 2) % CPMDebugState::BDOS_LOG_MAX;
             auto &e = dbg.bdosLog[idx];
             if (!e.valid)
                 break;
@@ -690,14 +725,15 @@ static void DrawBdosTab(CPMDebugState &dbg)
             ImGui::TableNextRow();
             if (i == 0)
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                    ImGui::GetColorU32(ImVec4(0.2f, 0.4f, 0.2f, 0.45f)));
+                                       ImGui::GetColorU32(ImVec4(0.2f, 0.4f, 0.2f, 0.45f)));
 
             ImGui::TableNextColumn();
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%02X", e.fn);
 
             ImGui::TableNextColumn();
             const char *name = (e.fn < BDOS_FUNCTION_COUNT)
-                               ? BDOS_FUNCTION_NAMES[e.fn] : "???";
+                                   ? BDOS_FUNCTION_NAMES[e.fn]
+                                   : "???";
             ImGui::TextUnformatted(name);
         }
 
@@ -777,18 +813,18 @@ static void CPMDebugPanel_ExecutionControl(intel8080 *cpu, CPMState &cpm, CPMDeb
     ImGui::SameLine();
     if (ImGui::Button("Step", ImVec2(65, 0)))
     {
-        dbg.runOnce   = true;
+        dbg.runOnce = true;
         dbg.notHalted = false;
     }
     ImGui::SameLine();
     if (ImGui::Button("Reset", ImVec2(65, 0)))
     {
-        cpu->PC                = 0;
-        dbg.totalCycles        = 0;
-        dbg.totalInstructions  = 0;
+        cpu->PC = 0;
+        dbg.totalCycles = 0;
+        dbg.totalInstructions = 0;
         dbg.currentInstruction = 0;
-        dbg.bdosLogHead        = 0;
-        dbg.bdosLogCount       = 0;
+        dbg.bdosLogHead = 0;
+        dbg.bdosLogCount = 0;
     }
 
     ImGui::Separator();
