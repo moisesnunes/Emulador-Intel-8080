@@ -2,11 +2,26 @@
 #define ALU_H
 
 #include <stdint.h>
+#include <functional>
 #include "intel8080.h"
 
 // Forward declaration — set to &cpm when running in CP/M mode, nullptr otherwise.
 struct CPMState;
 extern CPMState *g_serialState;
+
+// Per-port I/O handler table. Handlers return the byte read (IN) or consume cpu->A (OUT).
+// Unregistered ports return 0 on IN and are no-ops on OUT.
+using PortInFn  = std::function<uint8_t(intel8080 *)>;
+using PortOutFn = std::function<void(intel8080 *)>;
+
+void RegisterPortIn(uint8_t port, PortInFn fn);
+void RegisterPortOut(uint8_t port, PortOutFn fn);
+void ClearPortHandlers();
+
+// Machine-specific port registration helpers.
+void RegisterSpaceInvadersPorts(); // shift-register hardware (ports 2, 3, 4)
+void RegisterAltairSIOPorts();     // 88-SIO UART (ports 0x00, 0x01)
+void RegisterUSARTPorts();         // 8251 USART (ports 0x10, 0x11)
 
 uint16_t ReadWord(intel8080 *cpu, uint16_t pc);
 uint16_t AdvanceWord(intel8080 *const cpu);
