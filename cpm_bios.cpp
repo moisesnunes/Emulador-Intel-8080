@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <termios.h>
 
 // CP/M SYS attribute is stored as the extended attribute "user.cpm.sys" = "1".
 // R/O is mapped to POSIX write-permission bits (chmod) as before.
@@ -978,6 +979,137 @@ void SerialTick(CPMState &cpm)
     if (!s.enabled())
         return;
 
+    // ── Console mode: stdin → rxBuf, txBuf → stdout ───────────────────────
+    if (s.consoleMode)
+    {
+        if (!s.consoleInitialized)
+        {
+            // Save terminal state and switch to raw non-blocking mode.
+            tcgetattr(STDIN_FILENO, &s.consoleSavedTermios);
+            struct termios raw = s.consoleSavedTermios;
+            raw.c_iflag &= ~(ICRNL | IXON);
+            raw.c_lflag &= ~(ECHO | ICANON); // keep ISIG so Ctrl+C works
+            raw.c_cc[VMIN]  = 0;
+            raw.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+            s.consoleInitialized = true;
+        }
+
+        // stdin → rxBuf
+        uint8_t buf[64];
+        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        if (n > 0)
+            for (ssize_t i = 0; i < n; i++)
+                s.rxBuf.push_back(buf[i]);
+
+        // txBuf → stdout
+        if (!s.txBuf.empty())
+        {
+            std::vector<uint8_t> out(s.txBuf.begin(), s.txBuf.end());
+            ssize_t written = write(STDOUT_FILENO, out.data(), out.size());
+            if (written > 0)
+                s.txBuf.erase(s.txBuf.begin(), s.txBuf.begin() + written);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    // Get current time in milliseconds for baud rate throttling.
+    static uint64_t prevTimeMs = 0;
+    static bool timeInitialized = false;
+    if (!timeInitialized)
+    {
+        prevTimeMs = (uint64_t)(std::time(nullptr) * 1000);
+        timeInitialized = true;
+    }
+    uint64_t nowMs = (uint64_t)(std::time(nullptr) * 1000);
+    if (nowMs < prevTimeMs)
+        nowMs = prevTimeMs; // handle clock drift / overflow
+
+    // Calculate bytes-per-millisecond based on baud rate.
+    // 9600 baud = 1200 bytes/sec = 1.2 bytes/ms
+    // Safe to allow ~1 byte per ms in most cases.
+    double bytesPerMs = (double)s.baud / 8000.0; // 8000 bits per ms at full throttle
+    int maxBytesPerMs = std::max(1, (int)(bytesPerMs + 0.5));
+
+    // ── FIFO Mode ────────────────────────────────────────────────────────
+    if (!s.fifoPath.empty())
+    {
+        // Initialize FIFO on first call.
+        if (s.fifoFd < 0)
+        {
+            // Try to open the FIFO for non-blocking I/O.
+            // Note: FIFOs require both read and write ends; we open in O_RDWR
+            // to avoid blocking if the other side hasn't connected yet.
+            int fd = open(s.fifoPath.c_str(), O_RDWR | O_NONBLOCK);
+            if (fd >= 0)
+            {
+                s.fifoFd = fd;
+                s.fifoReadEnd = true;
+                s.fifoWriteEnd = true;
+                s.rxBuf.clear();
+                s.txBuf.clear();
+            }
+            // If open fails, keep trying on next tick.
+        }
+
+        if (s.fifoFd >= 0)
+        {
+            // Receive: FIFO → rxBuf (with throttling).
+            uint8_t buf[256];
+            ssize_t n = read(s.fifoFd, buf, sizeof(buf));
+            if (n > 0)
+            {
+                // Add bytes to receive queue, respecting baud rate limit.
+                for (ssize_t i = 0; i < n; i++)
+                {
+                    s.rxBuf.push_back(buf[i]);
+                }
+            }
+            else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+                // FIFO error or EOF.
+                close(s.fifoFd);
+                s.fifoFd = -1;
+                s.rxBuf.clear();
+                s.txBuf.clear();
+                return;
+            }
+
+            // Send: txBuf → FIFO (with throttling).
+            // Only send up to maxBytesPerMs per tick to respect baud rate.
+            if (!s.txBuf.empty())
+            {
+                // Reset byte counter each millisecond.
+                if (nowMs > s.lastByteTimeMs)
+                {
+                    s.lastByteTimeMs = nowMs;
+                    s.bytesThisMs = 0;
+                }
+
+                // Send bytes up to the throttle limit.
+                int toSend = std::min((int)s.txBuf.size(), maxBytesPerMs - s.bytesThisMs);
+                for (int i = 0; i < toSend; i++)
+                {
+                    uint8_t b = s.txBuf.front();
+                    ssize_t written = write(s.fifoFd, &b, 1);
+                    if (written > 0)
+                    {
+                        s.txBuf.pop_front();
+                        s.bytesThisMs++;
+                    }
+                    else
+                    {
+                        // Can't write now (FIFO full?); stop trying this frame.
+                        break;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // ── TCP Mode (original implementation) ─────────────────────────────────
     // Start listening on first call.
     if (s.listenFd < 0)
     {
@@ -1010,8 +1142,7 @@ void SerialTick(CPMState &cpm)
         {
             fcntl(fd, F_SETFL, O_NONBLOCK);
             s.clientFd = fd;
-            s.rxBuf.clear();
-            s.txBuf.clear();
+            s.rxBuf.clear(); // discard stale input from previous session
         }
     }
 
@@ -1038,14 +1169,40 @@ void SerialTick(CPMState &cpm)
     // Send: txBuf → client.
     if (!s.txBuf.empty())
     {
-        std::vector<uint8_t> tmp(s.txBuf.begin(), s.txBuf.end());
-        ssize_t sent = send(s.clientFd, tmp.data(), tmp.size(), MSG_NOSIGNAL);
-        if (sent > 0)
-            s.txBuf.erase(s.txBuf.begin(), s.txBuf.begin() + sent);
-        else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        if (s.baud > 0)
         {
-            close(s.clientFd);
-            s.clientFd = -1;
+            // Throttled: respect baud rate limit.
+            if (nowMs > s.lastByteTimeMs)
+            {
+                s.lastByteTimeMs = nowMs;
+                s.bytesThisMs = 0;
+            }
+            int toSend = std::min((int)s.txBuf.size(), maxBytesPerMs - s.bytesThisMs);
+            std::vector<uint8_t> sendBuf(s.txBuf.begin(), s.txBuf.begin() + toSend);
+            ssize_t sent = send(s.clientFd, sendBuf.data(), sendBuf.size(), MSG_NOSIGNAL);
+            if (sent > 0)
+            {
+                s.txBuf.erase(s.txBuf.begin(), s.txBuf.begin() + sent);
+                s.bytesThisMs += (int)sent;
+            }
+            else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+                close(s.clientFd);
+                s.clientFd = -1;
+            }
+        }
+        else
+        {
+            // No throttle (baud=0): flush entire buffer at once.
+            std::vector<uint8_t> sendBuf(s.txBuf.begin(), s.txBuf.end());
+            ssize_t sent = send(s.clientFd, sendBuf.data(), sendBuf.size(), MSG_NOSIGNAL);
+            if (sent > 0)
+                s.txBuf.erase(s.txBuf.begin(), s.txBuf.begin() + sent);
+            else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+                close(s.clientFd);
+                s.clientFd = -1;
+            }
         }
     }
 }
@@ -1061,6 +1218,16 @@ void SerialClose(CPMState &cpm)
     {
         close(cpm.serial.listenFd);
         cpm.serial.listenFd = -1;
+    }
+    if (cpm.serial.fifoFd >= 0)
+    {
+        close(cpm.serial.fifoFd);
+        cpm.serial.fifoFd = -1;
+    }
+    if (cpm.serial.consoleMode && cpm.serial.consoleInitialized)
+    {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &cpm.serial.consoleSavedTermios);
+        cpm.serial.consoleInitialized = false;
     }
 }
 
