@@ -1,6 +1,6 @@
 # Emulador Intel 8080 / Zilog Z80
 
-Emulador completo de processadores **Intel 8080** e **Zilog Z80** escrito em C++17 com interface gráfica via OpenGL 3.3 + Dear ImGui. Suporta quatro modos de operação distintos: **ARCADE**, **CP/M 2.2**, **Altair 8800** e **MSX**.
+Emulador completo de processadores **Intel 8080** e **Zilog Z80** com interface gráfica via OpenGL 3.3 + Dear ImGui. Suporta quatro modos de operação distintos: **ARCADE**, **CP/M 2.2**, **Altair 8800** e **MSX**.
 
 ---
 
