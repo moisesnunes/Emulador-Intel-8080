@@ -370,7 +370,7 @@ void RenderDebugData(long long &oneInstructionCycle, bool &notHalted, bool &runO
     {
         cpu->PC = 0;
         for (int address = 0x2000; address <= 0xFFFF; address++)
-            cpu->memory[address] = 0;
+            cpu->WriteMem((uint16_t)address, 0);
         for (int address = 0; address <= MAXINSTRUCTIONS; address++)
             previousInstructions[address] = 0;
     }
@@ -467,6 +467,21 @@ void DrawScreen(intel8080 *cpu, unsigned int shaderProgram, unsigned int VAO, un
 
     glUseProgram(shaderProgram);
     glBindVertexArray(VAO); // seeing as we only have a single VAO there's no need to bind it every time, but we'll do so to keep things a bit more organized
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+// Upload a pre-rendered 256×192 RGB frame (from the TMS9918A) and draw it.
+void DrawMSXScreen(unsigned int shaderProgram, unsigned int VAO, unsigned int texture,
+                   const uint8_t *rgb256x192)
+{
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 256, 192, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb256x192);
+    glUseProgram(shaderProgram);
+    glBindVertexArray(VAO);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
@@ -579,7 +594,8 @@ static void DrawPrinterWindow(CPMState &cpm)
     if (!cpm.printerWindowOpen)
         return;
     ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Impressora Virtual (LPT)", &cpm.printerWindowOpen)) {
+    if (!ImGui::Begin("Impressora Virtual (LPT)", &cpm.printerWindowOpen))
+    {
         ImGui::End();
         return;
     }
@@ -596,15 +612,17 @@ static void DrawPrinterWindow(CPMState &cpm)
         ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
 
-    if (ImGui::Button("Limpar")) {
+    if (ImGui::Button("Limpar"))
+    {
         cpm.printerBuffer.clear();
         lastLen = 0;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Abrir arquivo")) {
+    if (ImGui::Button("Abrir arquivo"))
+    {
         std::string path = !cpm.printerPath.empty()
-            ? cpm.printerPath
-            : (!cpm.diskDirs[0].empty() ? cpm.diskDirs[0] : ".") + "/CPM.LST";
+                               ? cpm.printerPath
+                               : (!cpm.diskDirs[0].empty() ? cpm.diskDirs[0] : ".") + "/CPM.LST";
         system(("xdg-open " + path + " &").c_str());
     }
     ImGui::End();
