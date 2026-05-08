@@ -41,26 +41,43 @@ intel8080::intel8080()
     }
 
     for (int i = 0; i < 0x10000; i++)
-    {
         memory[i] = 0;
-    }
+
+    for (int i = 0; i < (int)sizeof(memWritable); i++)
+        memWritable[i] = 0xFF; // all writable by default
 }
 
 void intel8080::WriteMem(uint16_t address, uint16_t value)
 {
+    if (!(memWritable[address >> 3] & (1 << (address & 7))))
+        return; // ROM/EPROM region — discard write
+
     if (!arcadeMode)
     {
-        // CP/M: flat 64 KB RAM, every address is writable
         this->memory[address] = (value & 0xff);
         return;
     }
-    // Arcade (Space Invaders): mirror RAM across the two VRAM banks and
-    // ignore writes to the ROM area (0x0000-0x1FFF).
-    if (address >= 0x2000)
+    // Arcade (Space Invaders): mirror writes across the two VRAM banks.
+    uint16_t baseMemory = address % 0x2000;
+    this->memory[baseMemory + 0x2000] = (value & 0xff);
+    this->memory[baseMemory + 0x4000] = (value & 0xff);
+}
+
+void intel8080::SetRomRegion(uint16_t addr, uint16_t size)
+{
+    for (int i = 0; i < size; i++)
     {
-        uint16_t baseMemory = address % 0x2000;
-        this->memory[baseMemory + 0x2000] = (value & 0xff);
-        this->memory[baseMemory + 0x4000] = (value & 0xff);
+        uint16_t a = (uint16_t)(addr + i);
+        memWritable[a >> 3] &= ~(1 << (a & 7));
+    }
+}
+
+void intel8080::SetRamRegion(uint16_t addr, uint16_t size)
+{
+    for (int i = 0; i < size; i++)
+    {
+        uint16_t a = (uint16_t)(addr + i);
+        memWritable[a >> 3] |= (1 << (a & 7));
     }
 }
 
