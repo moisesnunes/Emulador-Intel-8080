@@ -380,16 +380,25 @@ void RET(intel8080 *cpu)
 }
 
 // Conditional RET: base cost is 5 cycles (table); add 6 when taken → 11 total.
-#define COND_RET(cpu, cond) do { if (cond) { RET(cpu); (cpu)->cycles += 6; (cpu)->cyclesInterrupt += 6; } } while(0)
+#define COND_RET(cpu, cond)              \
+    do                                   \
+    {                                    \
+        if (cond)                        \
+        {                                \
+            RET(cpu);                    \
+            (cpu)->cycles += 6;          \
+            (cpu)->cyclesInterrupt += 6; \
+        }                                \
+    } while (0)
 
 void RNZ(intel8080 *cpu) { COND_RET(cpu, !cpu->zf); }
 void RNC(intel8080 *cpu) { COND_RET(cpu, !cpu->cf); }
 void RPO(intel8080 *cpu) { COND_RET(cpu, !cpu->pf); }
-void RP (intel8080 *cpu) { COND_RET(cpu, !cpu->sf); }
-void RZ (intel8080 *cpu) { COND_RET(cpu,  cpu->zf); }
-void RC (intel8080 *cpu) { COND_RET(cpu,  cpu->cf); }
-void RPE(intel8080 *cpu) { COND_RET(cpu,  cpu->pf); }
-void RM (intel8080 *cpu) { COND_RET(cpu,  cpu->sf); }
+void RP(intel8080 *cpu) { COND_RET(cpu, !cpu->sf); }
+void RZ(intel8080 *cpu) { COND_RET(cpu, cpu->zf); }
+void RC(intel8080 *cpu) { COND_RET(cpu, cpu->cf); }
+void RPE(intel8080 *cpu) { COND_RET(cpu, cpu->pf); }
+void RM(intel8080 *cpu) { COND_RET(cpu, cpu->sf); }
 
 #undef COND_RET
 
@@ -455,19 +464,29 @@ void Call(intel8080 *cpu)
 }
 
 // Conditional CALL: base cost is 11 cycles (table); add 6 when taken → 17 total.
-#define COND_CALL(cpu, cond) do { \
-    if (cond) { Call(cpu); (cpu)->cycles += 6; (cpu)->cyclesInterrupt += 6; } \
-    else      { AdvanceWord(cpu); } \
-} while(0)
+#define COND_CALL(cpu, cond)             \
+    do                                   \
+    {                                    \
+        if (cond)                        \
+        {                                \
+            Call(cpu);                   \
+            (cpu)->cycles += 6;          \
+            (cpu)->cyclesInterrupt += 6; \
+        }                                \
+        else                             \
+        {                                \
+            AdvanceWord(cpu);            \
+        }                                \
+    } while (0)
 
 void CNZ(intel8080 *cpu) { COND_CALL(cpu, !cpu->zf); }
 void CNC(intel8080 *cpu) { COND_CALL(cpu, !cpu->cf); }
 void CPO(intel8080 *cpu) { COND_CALL(cpu, !cpu->pf); }
-void CP (intel8080 *cpu) { COND_CALL(cpu, !cpu->sf); }
-void CZ (intel8080 *cpu) { COND_CALL(cpu,  cpu->zf); }
-void CC (intel8080 *cpu) { COND_CALL(cpu,  cpu->cf); }
-void CPE(intel8080 *cpu) { COND_CALL(cpu,  cpu->pf); }
-void CM (intel8080 *cpu) { COND_CALL(cpu,  cpu->sf); }
+void CP(intel8080 *cpu) { COND_CALL(cpu, !cpu->sf); }
+void CZ(intel8080 *cpu) { COND_CALL(cpu, cpu->zf); }
+void CC(intel8080 *cpu) { COND_CALL(cpu, cpu->cf); }
+void CPE(intel8080 *cpu) { COND_CALL(cpu, cpu->pf); }
+void CM(intel8080 *cpu) { COND_CALL(cpu, cpu->sf); }
 
 #undef COND_CALL
 
@@ -560,57 +579,106 @@ void XCHG(intel8080 *cpu)
     cpu->L = EReg;
 }
 
-void MachineIn(intel8080 *cpu)
+// ── Per-port handler table ───────────────────────────────────────────────────
+static PortInFn  g_portIn[256];
+static PortOutFn g_portOut[256];
+
+void RegisterPortIn(uint8_t port, PortInFn fn)  { g_portIn[port]  = fn; }
+void RegisterPortOut(uint8_t port, PortOutFn fn) { g_portOut[port] = fn; }
+
+void ClearPortHandlers()
 {
-    uint8_t portNum = AdvanceByte(cpu);
-    cpu->A = cpu->IOPorts[portNum];
-    switch (portNum)
-    {
-    case 3:
-        cpu->A = (cpu->shiftRegister >> (8 - cpu->shiftOffset)) & 0xFF;
-        break;
-    // 8251 USART simulation: port 0x10 = data, port 0x11 = status.
-    // Active only when a serial port is configured (g_serialState != nullptr).
-    case 0x10: // USART data read — pop one byte from rxBuf
-        if (g_serialState && g_serialState->serial.connected() &&
-            !g_serialState->serial.rxBuf.empty()) {
-            cpu->A = g_serialState->serial.rxBuf.front();
-            g_serialState->serial.rxBuf.pop_front();
-        } else {
-            cpu->A = 0x00;
-        }
-        break;
-    case 0x11: // USART status — bit 0 = RxRDY, bit 1 = TxRDY (always 1)
-        cpu->A = 0x02; // TxRDY always set
+    for (int i = 0; i < 256; i++) { g_portIn[i] = nullptr; g_portOut[i] = nullptr; }
+}
+
+// ── Machine-specific registration helpers ────────────────────────────────────
+
+void RegisterSpaceInvadersPorts()
+{
+    RegisterPortIn(3, [](intel8080 *cpu) -> uint8_t {
+        return (cpu->shiftRegister >> (8 - cpu->shiftOffset)) & 0xFF;
+    });
+    RegisterPortOut(2, [](intel8080 *cpu) {
+        cpu->shiftOffset = cpu->A & 0x07;
+    });
+    RegisterPortOut(4, [](intel8080 *cpu) {
+        uint16_t mask = 0xFF00;
+        uint16_t value = cpu->A << 8;
+        cpu->shiftRegister &= ~(mask >> cpu->shiftOffset);
+        cpu->shiftRegister |= value >> cpu->shiftOffset;
+    });
+}
+
+// 88-SIO (Altair 8800): port 0x00 = status, port 0x01 = data.
+// Bit 0 of status is ACTIVE LOW: 0 = input ready, 1 = no input.
+// Output routine checks ANI 0xC8 — error bits are kept clear so output always proceeds.
+void RegisterAltairSIOPorts()
+{
+    RegisterPortIn(0x00, [](intel8080 *) -> uint8_t {
         if (g_serialState && g_serialState->serial.connected() &&
             !g_serialState->serial.rxBuf.empty())
-            cpu->A |= 0x01; // RxRDY
-        break;
-    }
+            return 0x00; // bit 0 = 0 → input ready
+        return 0x01;     // bit 0 = 1 → no input
+    });
+    RegisterPortIn(0x01, [](intel8080 *) -> uint8_t {
+        if (g_serialState && g_serialState->serial.connected() &&
+            !g_serialState->serial.rxBuf.empty())
+        {
+            uint8_t b = g_serialState->serial.rxBuf.front();
+            g_serialState->serial.rxBuf.pop_front();
+            return b;
+        }
+        return 0x00;
+    });
+    // Buffer unconditionally so output before nc connects is not lost.
+    RegisterPortOut(0x01, [](intel8080 *cpu) {
+        if (g_serialState)
+            g_serialState->serial.txBuf.push_back(cpu->A);
+    });
+}
+
+// 8251 USART simulation: port 0x10 = data, port 0x11 = status/command.
+void RegisterUSARTPorts()
+{
+    RegisterPortIn(0x10, [](intel8080 *) -> uint8_t {
+        if (g_serialState && g_serialState->serial.connected() &&
+            !g_serialState->serial.rxBuf.empty())
+        {
+            uint8_t b = g_serialState->serial.rxBuf.front();
+            g_serialState->serial.rxBuf.pop_front();
+            return b;
+        }
+        return 0x00;
+    });
+    RegisterPortIn(0x11, [](intel8080 *) -> uint8_t {
+        // bit 0 = RxRDY, bit 1 = TxRDY, bit 7 = DSR/CD
+        uint8_t s = 0x02; // TxRDY always set
+        if (g_serialState && g_serialState->serial.connected())
+        {
+            s |= 0x80; // DSR/CD — caller present
+            if (!g_serialState->serial.rxBuf.empty())
+                s |= 0x01; // RxRDY
+        }
+        return s;
+    });
+    RegisterPortOut(0x10, [](intel8080 *cpu) {
+        if (g_serialState && g_serialState->serial.connected())
+            g_serialState->serial.txBuf.push_back(cpu->A);
+    });
+    RegisterPortOut(0x11, [](intel8080 *) {}); // command/mode write — ignored
+}
+
+// ── Dispatch ─────────────────────────────────────────────────────────────────
+
+void MachineIn(intel8080 *cpu)
+{
+    uint8_t port = AdvanceByte(cpu);
+    cpu->A = g_portIn[port] ? g_portIn[port](cpu) : cpu->IOPorts[port];
 }
 
 void MachineOut(intel8080 *cpu)
 {
-    uint8_t portNum = AdvanceByte(cpu);
-    // cpu->IOPorts[portNum] = cpu->A;
-    switch (portNum)
-    {
-    case 2:
-        cpu->shiftOffset = cpu->A & 0x07;
-        break;
-    case 4: {
-        uint16_t mask = 0xFF00;
-        uint16_t value = cpu->A << 8;
-        cpu->shiftRegister &= !(mask >> cpu->shiftOffset);
-        cpu->shiftRegister |= value >> cpu->shiftOffset;
-        break;
-    }
-    // 8251 USART simulation: port 0x10 = data write.
-    case 0x10: // USART data write — push byte to txBuf
-        if (g_serialState && g_serialState->serial.connected())
-            g_serialState->serial.txBuf.push_back(cpu->A);
-        break;
-    case 0x11: // USART command/mode write — ignored (no mode register emulated)
-        break;
-    }
+    uint8_t port = AdvanceByte(cpu);
+    if (g_portOut[port])
+        g_portOut[port](cpu);
 }
