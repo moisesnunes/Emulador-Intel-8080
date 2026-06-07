@@ -2,6 +2,8 @@
 
 Emulador completo de processadores **Intel 8080** e **Zilog Z80** com interface gráfica via OpenGL 3.3 + Dear ImGui. Suporta quatro modos de operação distintos: **ARCADE**, **CP/M 2.2**, **Altair 8800** e **MSX**.
 
+![cpm](cpm.png)
+
 ---
 
 ## Sumário
